@@ -1,0 +1,161 @@
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import streamlit as st
+from datetime import datetime
+
+from backend.phase1.run import run as run_phase1
+from backend.phase2.run import run as run_phase2
+from backend.phase3.run import run as run_phase3
+from backend.phase4.run import run as run_phase4
+from backend.phase5.run import run as run_phase5
+
+st.set_page_config(page_title="SASD HFML Pipeline", layout="centered")
+
+st.markdown("""
+<style>
+    .block-container { padding-top: 2rem; max-width: 780px; }
+
+    /* Left-align phase buttons */
+    div[data-testid="stButton"] button {
+        text-align: left !important;
+        justify-content: flex-start !important;
+        padding-left: 1rem;
+        font-size: 0.95rem;
+    }
+
+    /* Status badge base */
+    .badge {
+        display: inline-block;
+        padding: 4px 10px;
+        border-radius: 20px;
+        font-size: 0.78rem;
+        font-weight: 600;
+        white-space: nowrap;
+        margin-top: 6px;
+    }
+    .badge-idle    { color: #6B7280; border: 1px solid #374151; }
+    .badge-running { color: #F59E0B; border: 1px solid #92400E; animation: pulse 1.2s ease-in-out infinite; }
+    .badge-complete{ color: #10B981; border: 1px solid #065F46; }
+    .badge-failed  { color: #EF4444; border: 1px solid #7F1D1D; }
+
+    @keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50%       { opacity: 0.4; }
+    }
+
+    /* Log area monospace */
+    .stTextArea textarea {
+        font-family: 'Courier New', monospace !important;
+        font-size: 0.82rem !important;
+        background-color: #0D1117 !important;
+        color: #8B949E !important;
+        border: 1px solid #30363D !important;
+    }
+
+    /* Divider spacing */
+    hr { margin: 1rem 0 !important; border-color: #21262D !important; }
+
+    /* Phase row vertical alignment */
+    .badge-cell {
+        display: flex;
+        align-items: center;
+        height: 100%;
+        padding-top: 4px;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+PHASES = [
+    ("phase1", "Import SQL query results into Excel",          run_phase1),
+    ("phase2", "Detect ML changes and rebuild workbook",       run_phase2),
+    ("phase3", "Sync Excel data to ArcGIS attribute table",    run_phase3),
+    ("phase4", "Append upstream features for new HFMLs",       run_phase4),
+    ("phase5", "Export PDF maps for new HFMLs",                run_phase5),
+]
+
+for key, _, _ in PHASES:
+    if f"status_{key}" not in st.session_state:
+        st.session_state[f"status_{key}"] = "idle"
+if "log_lines" not in st.session_state:
+    st.session_state.log_lines = []
+
+
+def add_log(msg):
+    ts = datetime.now().strftime("%H:%M:%S")
+    st.session_state.log_lines.append(f"[{ts}]  {msg}")
+
+
+def badge_html(status):
+    labels = {
+        "idle":     ("● Not Run",   "badge-idle"),
+        "running":  ("● Running…",  "badge-running"),
+        "complete": ("✓ Complete",  "badge-complete"),
+        "failed":   ("✗ Failed",    "badge-failed"),
+    }
+    text, cls = labels.get(status, labels["idle"])
+    return f'<div class="badge-cell"><span class="badge {cls}">{text}</span></div>'
+
+
+def execute_phase(key, label, runner):
+    st.session_state[f"status_{key}"] = "running"
+    add_log(f"{label} — started")
+    try:
+        runner(add_log)
+        st.session_state[f"status_{key}"] = "complete"
+    except Exception as e:
+        st.session_state[f"status_{key}"] = "failed"
+        add_log(f"ERROR: {e}")
+        raise
+
+
+# ── Header ────────────────────────────────────────────────────────────────────
+st.title("SASD HFML Pipeline")
+st.caption("High Frequency Mainline — monthly data pipeline")
+
+st.markdown("---")
+
+# ── Run All ───────────────────────────────────────────────────────────────────
+if st.button("▶  Run All Phases", use_container_width=True, type="primary"):
+    for key, label, runner in PHASES:
+        try:
+            execute_phase(key, label, runner)
+        except Exception:
+            add_log("Pipeline halted.")
+            break
+    else:
+        add_log("Pipeline complete.")
+    st.rerun()
+
+st.markdown("---")
+
+# ── Phase rows ────────────────────────────────────────────────────────────────
+for key, label, runner in PHASES:
+    status = st.session_state[f"status_{key}"]
+    col_btn, col_badge = st.columns([5, 1])
+    with col_btn:
+        if st.button(label, key=f"btn_{key}", use_container_width=True):
+            try:
+                execute_phase(key, label, runner)
+            except Exception:
+                pass
+            st.rerun()
+    with col_badge:
+        st.markdown(badge_html(status), unsafe_allow_html=True)
+
+st.markdown("---")
+
+# ── Log panel ─────────────────────────────────────────────────────────────────
+col_title, col_clear = st.columns([5, 1])
+with col_title:
+    st.subheader("Log Output")
+with col_clear:
+    st.markdown("<div style='margin-top:8px'>", unsafe_allow_html=True)
+    if st.button("Clear", use_container_width=True):
+        st.session_state.log_lines = []
+        st.rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
+
+log_text = "\n".join(st.session_state.log_lines) if st.session_state.log_lines else "No output yet."
+st.text_area("log", value=log_text, height=300, disabled=True, label_visibility="collapsed")
