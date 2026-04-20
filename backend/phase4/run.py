@@ -67,7 +67,7 @@ def _trace_upstream(ml_id, network, geoms, blacklist, log_fn):
     return to_append
 
 
-def _append_features(oid_list, source, destination, log_fn):
+def _append_by_oids(oid_list, source, destination):
     if not oid_list:
         return
     query = f"OBJECTID IN ({','.join(map(str, oid_list))})"
@@ -75,6 +75,32 @@ def _append_features(oid_list, source, destination, log_fn):
     arcpy.management.MakeFeatureLayer(source, "TmpSubset")
     arcpy.management.Append("TmpSubset", destination, "NO_TEST")
     arcpy.management.Delete("TmpSubset")
+
+
+def _select_lls_contacting_mls(ml_oid_list):
+    # Select the appended ML features, then select all LLs that contact them
+    query = f"OBJECTID IN ({','.join(map(str, ml_oid_list))})"
+    arcpy.management.SelectLayerByAttribute(ML_DEST, "NEW_SELECTION", query)
+    arcpy.management.SelectLayerByLocation(
+        LL_SOURCE, "BOUNDARY_TOUCHES", ML_DEST, selection_type="NEW_SELECTION"
+    )
+    ll_oids = [row[0] for row in arcpy.da.SearchCursor(LL_SOURCE, ["OBJECTID"])]
+    arcpy.management.SelectLayerByAttribute(LL_SOURCE, "CLEAR_SELECTION")
+    arcpy.management.SelectLayerByAttribute(ML_DEST, "CLEAR_SELECTION")
+    return ll_oids
+
+
+def _select_parcels_intersecting_lls(ll_oid_list):
+    # Select the appended LL features, then select all parcels that intersect them
+    query = f"OBJECTID IN ({','.join(map(str, ll_oid_list))})"
+    arcpy.management.SelectLayerByAttribute(LL_DEST, "NEW_SELECTION", query)
+    arcpy.management.SelectLayerByLocation(
+        PARCELS_SOURCE, "INTERSECT", LL_DEST, selection_type="NEW_SELECTION"
+    )
+    parcel_oids = [row[0] for row in arcpy.da.SearchCursor(PARCELS_SOURCE, ["OBJECTID"])]
+    arcpy.management.SelectLayerByAttribute(PARCELS_SOURCE, "CLEAR_SELECTION")
+    arcpy.management.SelectLayerByAttribute(LL_DEST, "CLEAR_SELECTION")
+    return parcel_oids
 
 
 def run(log_fn):
@@ -91,21 +117,26 @@ def run(log_fn):
         return
 
     log_fn("Indexing network and building geometry blacklist...")
-    blacklist        = _build_blacklist(log_fn)
-    network, geoms   = _build_network(log_fn)
+    blacklist      = _build_blacklist(log_fn)
+    network, geoms = _build_network(log_fn)
 
     for ml_id in added_ml_ids:
-        log_fn(f"Tracing upstream for ML {ml_id}...")
+        log_fn(f"Processing HFML {ml_id}...")
 
+        # 1. Trace and append all upstream MLs recursively
         ml_oids = _trace_upstream(ml_id, network, geoms, blacklist, log_fn)
-        _append_features(ml_oids, ML_SOURCE, ML_DEST, log_fn)
+        _append_by_oids(ml_oids, ML_SOURCE, ML_DEST)
+        log_fn(f"  Appended {len(ml_oids)} upstream ML segments")
 
-        # TODO: implement LL selection logic (spatial or network-based — verify approach)
-        # _append_features(ll_oids, LL_SOURCE, LL_DEST, log_fn)
+        # 2. Select all LLs that contact the appended MLs, then append them
+        # TODO: confirm BOUNDARY_TOUCHES is the correct spatial relationship for LLs contacting MLs
+        ll_oids = _select_lls_contacting_mls(ml_oids)
+        _append_by_oids(ll_oids, LL_SOURCE, LL_DEST)
+        log_fn(f"  Appended {len(ll_oids)} LLs contacting upstream MLs")
 
-        # TODO: implement Parcel selection logic (intersect or association — verify approach)
-        # _append_features(parcel_oids, PARCELS_SOURCE, PARCELS_DEST, log_fn)
-
-        log_fn(f"ML {ml_id} — appended {len(ml_oids)} upstream segments")
+        # 3. Select all parcels that intersect the appended LLs, then append them
+        parcel_oids = _select_parcels_intersecting_lls(ll_oids)
+        _append_by_oids(parcel_oids, PARCELS_SOURCE, PARCELS_DEST)
+        log_fn(f"  Appended {len(parcel_oids)} parcels intersecting LLs")
 
     log_fn(f"Phase 4 complete — {len(added_ml_ids)} HFMLs processed")
