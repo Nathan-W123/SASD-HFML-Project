@@ -7,7 +7,7 @@ A locally-run Streamlit desktop application that automates the monthly High Freq
 - **Phase 1** — Connect to SQL database, run query, export results, import into Excel as a new `import` sheet
 - **Phase 2** — Excel manipulation: detect added/removed MLs and frequency changes, rebuild the working sheet
 - **Phase 3** — Sync Excel data to ArcGIS attribute table via Excel To Table and Append with upsert logic
-- **Phase 4** — For each new HFML, append associated ML, LL, and upstream parcel features to the dataset
+- **Phase 4** — For each new HFML, recursively trace and append all upstream ML segments, then append all LLs contacting those MLs, then append all parcels intersecting those LLs
 - **Phase 5** — Generate and export a PDF map for each new HFML using the appropriate map template
 
 ## Project Structure

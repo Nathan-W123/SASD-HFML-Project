@@ -22,7 +22,7 @@ launch.bat      — Windows double-click launcher
 - `backend/phase1/run.py` — full skeleton: SQL query → CSV → Excel `import` sheet
 - `backend/phase2/run.py` — full skeleton: detect added MLs + frequency changes, append to mainlines, delete import sheet, write `temp/added_mls.json`
 - `backend/phase3/run.py` — skeleton: arcpy ExcelToTable + Append upsert with field mapping
-- `backend/phase4/run.py` — skeleton: loop over added HFMLs, upstream network trace, append ML segments. LL and parcel logic stubbed with TODOs.
+- `backend/phase4/run.py` — skeleton: loop over added HFMLs, recursive upstream ML trace, append MLs → select contacting LLs → append LLs → select intersecting parcels → append parcels
 - `backend/phase5/run.py` — skeleton: aspect ratio template selection, arcpy.mp PDF export loop. Element/layer names stubbed with TODOs.
 
 **Prototype scripts (reference only)**
@@ -55,9 +55,8 @@ Note: `arcpy` is not in requirements.txt — it comes from ArcGIS Pro's conda en
 - Confirm field mapping names in `FIELD_MAPPINGS` match the ArcGIS feature class schema
 
 ### Phase 4
-- Implement LL selection logic (spatial or network-based — verify approach with GIS data)
-- Implement Parcel selection logic
-- Confirm `LL_SOURCE`, `LL_DEST`, `PARCELS_SOURCE`, `PARCELS_DEST` layer names
+- Confirm `LL_SOURCE`, `LL_DEST`, `PARCELS_SOURCE`, `PARCELS_DEST` layer names in `backend/phase4/run.py`
+- Verify `BOUNDARY_TOUCHES` is the correct spatial relationship for LLs contacting MLs
 
 ### Phase 5
 - Open the `.aprx` templates and confirm:

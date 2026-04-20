@@ -76,16 +76,16 @@
 
 ## Phase 4: Append ML, LL, and Parcels for New HFMLs
 
-1. Read the added MLs list produced in Phase 2a
-2. For each new ML in the list:
-   - Query the ArcGIS feature class to select the ML feature by unique ID
-   - Run an upstream network trace or spatial selection to identify associated LL features upstream of the selected ML
-   - Select all parcel features that intersect or are associated with those LL features
-   - Append the selected ML feature to the target ML dataset
-   - Append the selected LL features to the target LL dataset
-   - Append the selected parcel features to the target parcels dataset
-   - Log: "Appended ML [ID] with X LLs and Y parcels"
-3. After all MLs processed, log: "Phase 4 complete — X new HFMLs appended"
+1. Read the added HFMLs list produced in Phase 2
+2. For each new HFML in the list:
+   - Recursively trace upstream from the HFML, finding all ML segments that feed into it and all segments that feed into those, until no further upstream segments exist
+   - Append all traced upstream ML segments to the target ML dataset
+   - Select all LL features that contact the appended ML segments
+   - Append those LL features to the target LL dataset
+   - Select all parcel features that intersect the appended LL features
+   - Append those parcel features to the target parcels dataset
+   - Log counts for each step
+3. After all HFMLs processed, log: "Phase 4 complete — X new HFMLs processed"
 
 ---
 

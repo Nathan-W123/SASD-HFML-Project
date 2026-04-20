@@ -17,7 +17,7 @@ Run sequentially by a single user. Each phase is a discrete Python subscript.
 - **Phase 1:** Connect to SQL database, run query, export result, import CSV into a new Excel sheet named `import`
 - **Phase 2:** Excel manipulation — add vlookup-equivalent logic to detect added/removed MLs and frequency changes, create new sheet with current data, delete old sheets, rename to match original sheet name
 - **Phase 3:** Sync Excel data to ArcGIS attribute table — run Excel To Table geoprocessing, use Append tool with field mapping and upsert logic keyed on unique ID field
-- **Phase 4:** For each new HFML, append associated ML, LL, and upstream parcels to the dataset
+- **Phase 4:** For each new HFML, recursively trace and append all upstream ML segments, then append all LLs contacting those MLs, then append all parcels intersecting those LLs
 - **Phase 5:** For each new appended dataset, generate a PDF map from the appropriate template (vertical or horizontal based on data fit) and export to the shared output directory
 
 ## File & Path Rules
