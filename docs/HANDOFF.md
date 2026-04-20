@@ -3,33 +3,31 @@
 ## What's been built
 
 **Project structure**
-- `frontend/` — Streamlit UI
-- `backend/` — phase scripts (phase1–5)
-- `docs/` — CLAUDE.md (ruleset), PIPELINE.md (workflow), this file
-- `.streamlit/` — dark theme config (must stay at project root)
+```
+frontend/       — Streamlit UI
+backend/        — phase1–5 scripts
+docs/           — CLAUDE.md, PIPELINE.md, this file
+.streamlit/     — dark theme config (must stay at project root)
+temp/           — runtime data passed between phases (gitignored)
+config.json     — all shared paths and SQL connection details
+config_loader.py — validates config.json on load
+requirements.txt — pip dependencies
+launch.bat      — Windows double-click launcher
+```
 
 **Frontend**
-- `frontend/app.py` — full Streamlit UI: dark theme, descriptive phase buttons, per-phase status badges (Not Run / Running / Complete / Failed), Run All at top (halts + highlights on failure), scrollable monospace log panel with Clear button
+- `frontend/app.py` — dark-themed Streamlit UI: descriptive phase buttons, per-phase status badges, Run All at top (halts on failure), scrollable log panel, config validation warning on startup
 
-**Backend**
-- `backend/phase1/run.py` — stub, wired into app
-- `backend/phase2/run.py` — stub, wired into app
-- `backend/phase3/run.py` — stub, wired into app
-- `backend/phase4/run.py` — stub, wired into app
-- `backend/phase5/run.py` — stub, wired into app
-- `backend/phase1/SASD HFML Querying GIS import.py` — Phase 1 prototype (SQL → Excel)
-- `backend/phase4/SASD HFML Mainline Append.py` — Phase 4 prototype (upstream network trace + append)
+**Backend — all phases wired into app via `run(log_fn)` signature**
+- `backend/phase1/run.py` — full skeleton: SQL query → CSV → Excel `import` sheet
+- `backend/phase2/run.py` — full skeleton: detect added MLs + frequency changes, append to mainlines, delete import sheet, write `temp/added_mls.json`
+- `backend/phase3/run.py` — skeleton: arcpy ExcelToTable + Append upsert with field mapping
+- `backend/phase4/run.py` — skeleton: loop over added HFMLs, upstream network trace, append ML segments. LL and parcel logic stubbed with TODOs.
+- `backend/phase5/run.py` — skeleton: aspect ratio template selection, arcpy.mp PDF export loop. Element/layer names stubbed with TODOs.
 
-**Config**
-- `config.json` — all shared network drive paths and SQL connection details. Excel workbook path is constant, does not change monthly. Update paths to match actual network drive locations before running.
-- `config_loader.py` — loads and validates config.json on startup. All phases import this with:
-    ```python
-    from config_loader import load_config
-    config = load_config()
-    ```
-
-**Launcher**
-- `launch.bat` — Windows double-click launcher, activates ArcGIS Pro conda env and starts the app
+**Prototype scripts (reference only)**
+- `backend/phase1/SASD HFML Querying GIS import.py` — original Phase 1 prototype
+- `backend/phase4/SASD HFML Mainline Append.py` — original Phase 4 prototype
 
 ## How to run
 
@@ -42,15 +40,39 @@ python3 -m streamlit run frontend/app.py
 **Windows work machine:**
 Double-click `launch.bat` — no terminal needed.
 
-## What's blocked / next steps
+**Install dependencies:**
+```
+pip install -r requirements.txt
+```
+Note: `arcpy` is not in requirements.txt — it comes from ArcGIS Pro's conda environment, handled by `launch.bat`.
 
-- **Phase 1** — needs SQL Server access and the .sql file on the network drive. Prototype exists in `backend/phase1/` to build from.
-- **Phase 2** — needs access to the real Excel workbook to confirm column names and sheet structure before writing openpyxl logic
-- **Phase 3** — needs arcpy (ArcGIS Pro)
-- **Phase 4** — needs arcpy. Prototype exists in `backend/phase4/` to build from.
-- **Phase 5** — needs arcpy and the actual .aprx template files on the network drive
+## What needs to be done on the work machine
+
+### Phase 2
+- Open the Excel workbook and confirm `ML_ID_COL` and `FREQ_COL` values at the top of `backend/phase2/run.py`
+
+### Phase 3
+- Confirm field mapping names in `FIELD_MAPPINGS` match the ArcGIS feature class schema
+
+### Phase 4
+- Implement LL selection logic (spatial or network-based — verify approach with GIS data)
+- Implement Parcel selection logic
+- Confirm `LL_SOURCE`, `LL_DEST`, `PARCELS_SOURCE`, `PARCELS_DEST` layer names
+
+### Phase 5
+- Open the `.aprx` templates and confirm:
+  - `HFML_LAYER_NAME` — the layer to scope with a definition query
+  - `HFML_ID_FIELD` — the field used in the definition query
+  - `TEXT_ELEMENT_TITLE`, `TEXT_ELEMENT_DATE`, `TEXT_ELEMENT_ID` — dynamic text element names
+  - Map frame element name (currently assumes index 0)
+
+### config.json
+- Verify all network drive paths are correct before first run
+- `excel_workbook_path` is constant and does not change monthly
 
 ## Key decisions
-- Each phase exposes a single `run(log_fn)` function — phase writes output via the callback, app displays it in the log panel
-- All paths and credentials live in `config.json`, never hardcoded in scripts
-- `.streamlit/config.toml` must stay at the project root — Streamlit requires it there
+- Each phase exposes `run(log_fn)` — output via callback, displayed in Streamlit log panel
+- Phases 2 → 4/5 communicate via `temp/added_mls.json` (gitignored, created at runtime)
+- All paths and credentials in `config.json`, never hardcoded
+- `.streamlit/config.toml` must stay at project root — Streamlit requires it
+- Removed MLs are intentionally ignored — only added MLs are appended

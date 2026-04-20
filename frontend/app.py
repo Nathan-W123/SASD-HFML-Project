@@ -10,6 +10,7 @@ from backend.phase2.run import run as run_phase2
 from backend.phase3.run import run as run_phase3
 from backend.phase4.run import run as run_phase4
 from backend.phase5.run import run as run_phase5
+from config_loader import load_config
 
 st.set_page_config(page_title="SASD HFML Pipeline", layout="centered")
 
@@ -110,9 +111,19 @@ def execute_phase(key, label, runner):
         raise
 
 
+# ── Config check ──────────────────────────────────────────────────────────────
+try:
+    load_config()
+    _config_ok = True
+except Exception as _config_err:
+    _config_ok = False
+
 # ── Header ────────────────────────────────────────────────────────────────────
 st.title("SASD HFML Pipeline")
 st.caption("High Frequency Mainline — monthly data pipeline")
+
+if not _config_ok:
+    st.error(f"config.json error: {_config_err} — update config.json before running any phase.")
 
 st.markdown("---")
 
