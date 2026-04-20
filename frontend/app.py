@@ -2,6 +2,8 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import subprocess
+
 import streamlit as st
 from datetime import datetime
 
@@ -76,6 +78,8 @@ PHASES = [
     ("phase5", "Export PDF maps for new HFMLs",                run_phase5),
 ]
 
+SUBPROCESS_PHASES = {"phase3", "phase4", "phase5"}
+
 for key, _, _ in PHASES:
     if f"status_{key}" not in st.session_state:
         st.session_state[f"status_{key}"] = "idle"
@@ -99,11 +103,35 @@ def badge_html(status):
     return f'<div class="badge-cell"><span class="badge {cls}">{text}</span></div>'
 
 
+def execute_phase_subprocess(key, log_fn):
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    runner_path = os.path.join(project_root, "backend", "run_phase.py")
+    proc = subprocess.Popen(
+        [sys.executable, "-u", runner_path, key],
+        cwd=project_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+
+    for line in proc.stdout:
+        line = line.rstrip()
+        if line:
+            log_fn(line)
+
+    if proc.wait() != 0:
+        raise RuntimeError(f"{key} failed in ArcGIS subprocess")
+
+
 def execute_phase(key, label, runner):
     st.session_state[f"status_{key}"] = "running"
     add_log(f"{label} — started")
     try:
-        runner(add_log)
+        if key in SUBPROCESS_PHASES:
+            execute_phase_subprocess(key, add_log)
+        else:
+            runner(add_log)
         st.session_state[f"status_{key}"] = "complete"
     except Exception as e:
         st.session_state[f"status_{key}"] = "failed"

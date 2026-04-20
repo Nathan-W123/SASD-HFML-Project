@@ -31,7 +31,10 @@ def run(log_fn):
     conn.close()
     log_fn(f"{len(df)} rows returned from query")
 
-    df = df.apply(lambda col: pd.to_numeric(col, errors="ignore"))
+    for col in df.select_dtypes(include="object").columns:
+        converted = pd.to_numeric(df[col], errors="coerce")
+        if converted.notna().all():
+            df[col] = converted
 
     tmp = tempfile.NamedTemporaryFile(suffix=".csv", delete=False)
     tmp_path = tmp.name

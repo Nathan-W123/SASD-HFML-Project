@@ -2,12 +2,12 @@
     "sql_server": "SDP-MaxDayOff",
     "sql_database": "MAXIMO",
     "sql_query_path": "\\\\sdfiles\\Shared\\SASD_Ops\\Engineering\\Bus_Planning\\4. Regulatory Support\\Requests within SacSewer (Internal)\\ENG\\Business Planning\\Stop_The_Clog\\High Frequency PMs\\Queries\\Hydro_PMs.sql",
-    "excel_workbook_path": "\\\\sdfiles\\Shared\\SASD_Ops\\Engineering\\Bus_Planning\\4. Regulatory Support\\Requests within SacSewer (Internal)\\ENG\\Business Planning\\Stop_The_Clog\\High Frequency PMs\\Hydro_1_3_6.xlsx",
+    "excel_workbook_path": "\\\\sdfiles\\Shared\\SASD_Ops\\Engineering\\Bus_Planning\\4. Regulatory Support\\Requests within SacSewer (Internal)\\ENG\\Business Planning\\Stop_The_Clog\\High Frequency PMs\\FlowSync\\TEST.xlsx",
     "excel_working_sheet": "mainlines",
-    "arcgis_project_path": "\\\\sdfiles\\Shared\\SASD_Ops\\GIS\\Projects\\HFML\\HFML.aprx",
-    "feature_class_path": "\\\\sdfiles\\Shared\\SASD_Ops\\GIS\\Projects\\HFML\\HFML.gdb\\HighFreqML",
+    "arcgis_project_path": "\\\\sdfiles\\Shared\\SASD_Ops\\Engineering\\Bus_Planning\\4. Regulatory Support\\Requests within SacSewer (Internal)\\ENG\\Business Planning\\Stop_The_Clog\\High Frequency PMs\\FlowSync\\GIS\\TEST.aprx",
+    "feature_class_path": "\\\\sdfiles\\Shared\\SASD_Ops\\Engineering\\Bus_Planning\\4. Regulatory Support\\Requests within SacSewer (Internal)\\ENG\\Business Planning\\Stop_The_Clog\\High Frequency PMs\\FlowSync\\GIS\\Data.gdb\\PM_Mainlines",
     "template_vertical_path": "\\\\sdfiles\\Shared\\SASD_Ops\\GIS\\Projects\\HFML\\templates\\template_vertical.aprx",
     "template_horizontal_path": "\\\\sdfiles\\Shared\\SASD_Ops\\GIS\\Projects\\HFML\\templates\\template_horizontal.aprx",
     "pdf_output_dir": "\\\\sdfiles\\Shared\\SASD_Ops\\GIS\\Projects\\HFML\\PDF_Output",
-    "unique_id_field": "WONUM"
+    "unique_id_field": "pmnum"
 }

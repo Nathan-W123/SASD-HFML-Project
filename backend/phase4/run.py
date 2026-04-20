@@ -3,7 +3,6 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import json
-import arcpy
 
 from config_loader import load_config
 
@@ -104,6 +103,8 @@ def _select_parcels_intersecting_lls(ll_oid_list):
 
 
 def run(log_fn):
+    import arcpy
+
     config = load_config()
 
     if not os.path.exists(TEMP_PATH):

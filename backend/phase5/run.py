@@ -4,8 +4,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 
 import json
 import shutil
-import arcpy
-import arcpy.mp
 
 from config_loader import load_config
 
@@ -44,6 +42,9 @@ def _get_hfml_extent(hfml_id, feature_class):
 
 
 def run(log_fn):
+    import arcpy
+    import arcpy.mp
+
     config = load_config()
 
     if not os.path.exists(TEMP_PATH):
