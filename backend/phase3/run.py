@@ -98,12 +98,20 @@ def run(log_fn):
             added_ids = [str(x) for x in json.load(f)]
 
     if added_ids:
-        added_id_set = set(added_ids)
+        def _norm(val):
+            try:
+                return str(int(float(val)))
+            except (ValueError, TypeError):
+                return str(val)
+
+        added_id_set = {_norm(x) for x in added_ids}
+        flagged = 0
         with arcpy.da.UpdateCursor(target, ["pmnum", NEW_FLAG_FIELD]) as cursor:
             for row in cursor:
-                if str(row[0]) in added_id_set:
+                if _norm(row[0]) in added_id_set:
                     row[1] = 1
                     cursor.updateRow(row)
-        log_fn(f"{len(added_ids)} new rows flagged in '{NEW_FLAG_FIELD}' field")
+                    flagged += 1
+        log_fn(f"{flagged} new rows flagged in '{NEW_FLAG_FIELD}' field")
 
     log_fn("Phase 3 complete — attribute table updated")

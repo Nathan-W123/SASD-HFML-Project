@@ -103,7 +103,7 @@ def badge_html(status):
     return f'<div class="badge-cell"><span class="badge {cls}">{text}</span></div>'
 
 
-def execute_phase_subprocess(key, log_fn):
+def execute_phase_subprocess(key, log_fn, refresh_fn):
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     runner_path = os.path.join(project_root, "backend", "run_phase.py")
     proc = subprocess.Popen(
@@ -119,17 +119,19 @@ def execute_phase_subprocess(key, log_fn):
         line = line.rstrip()
         if line:
             log_fn(line)
+            refresh_fn()
 
     if proc.wait() != 0:
         raise RuntimeError(f"{key} failed in ArcGIS subprocess")
 
 
-def execute_phase(key, label, runner):
+def execute_phase(key, label, runner, refresh_fn):
     st.session_state[f"status_{key}"] = "running"
     add_log(f"{label} — started")
+    refresh_fn()
     try:
         if key in SUBPROCESS_PHASES:
-            execute_phase_subprocess(key, add_log)
+            execute_phase_subprocess(key, add_log, refresh_fn)
         else:
             runner(add_log)
         st.session_state[f"status_{key}"] = "complete"
@@ -156,36 +158,11 @@ if not _config_ok:
 st.markdown("---")
 
 # ── Run All ───────────────────────────────────────────────────────────────────
-if st.button("▶  Run All Phases", use_container_width=True, type="primary"):
-    for key, label, runner in PHASES:
-        try:
-            execute_phase(key, label, runner)
-        except Exception:
-            add_log("Pipeline halted.")
-            break
-    else:
-        add_log("Pipeline complete.")
-    st.rerun()
+_run_all = st.button("▶  Run All Phases", use_container_width=True, type="primary")
 
 st.markdown("---")
 
-# ── Phase rows ────────────────────────────────────────────────────────────────
-for key, label, runner in PHASES:
-    status = st.session_state[f"status_{key}"]
-    col_btn, col_badge = st.columns([5, 1])
-    with col_btn:
-        if st.button(label, key=f"btn_{key}", use_container_width=True):
-            try:
-                execute_phase(key, label, runner)
-            except Exception:
-                pass
-            st.rerun()
-    with col_badge:
-        st.markdown(badge_html(status), unsafe_allow_html=True)
-
-st.markdown("---")
-
-# ── Log panel ─────────────────────────────────────────────────────────────────
+# ── Log panel — created before phase buttons so placeholder is live during execution ──
 col_title, col_clear = st.columns([5, 1])
 with col_title:
     st.subheader("Log Output")
@@ -196,5 +173,40 @@ with col_clear:
         st.rerun()
     st.markdown("</div>", unsafe_allow_html=True)
 
-log_text = "\n".join(st.session_state.log_lines) if st.session_state.log_lines else "No output yet."
-st.text_area("log", value=log_text, height=300, disabled=True, label_visibility="collapsed")
+_log_placeholder = st.empty()
+
+
+def _render_log():
+    log_text = "\n".join(st.session_state.log_lines) if st.session_state.log_lines else "No output yet."
+    _log_placeholder.code(log_text, language=None)
+
+
+_render_log()
+
+st.markdown("---")
+
+# ── Phase rows ────────────────────────────────────────────────────────────────
+for key, label, runner in PHASES:
+    status = st.session_state[f"status_{key}"]
+    col_btn, col_badge = st.columns([5, 1])
+    with col_btn:
+        if st.button(label, key=f"btn_{key}", use_container_width=True):
+            try:
+                execute_phase(key, label, runner, _render_log)
+            except Exception:
+                pass
+            st.rerun()
+    with col_badge:
+        st.markdown(badge_html(status), unsafe_allow_html=True)
+
+# ── Run All execution (after placeholders are created) ────────────────────────
+if _run_all:
+    for key, label, runner in PHASES:
+        try:
+            execute_phase(key, label, runner, _render_log)
+        except Exception:
+            add_log("Pipeline halted.")
+            break
+    else:
+        add_log("Pipeline complete.")
+    st.rerun()
