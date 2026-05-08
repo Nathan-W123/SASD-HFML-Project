@@ -3,13 +3,16 @@ import sys
 import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
+import json
+
 from config_loader import load_config
 
 BUFFER_DISTANCE = "50000 Feet"
-LL_SEARCH_DISTANCE = "3 Feet"
-POC_PMNUM = "9406"
-PMNUM_FIELD_CANDIDATES = ("pmnum", "PM_Mainlines_pmnum")
+LL_SEARCH_DISTANCE = "1 Foot"
 ARCPY_RETRY_ATTEMPTS = 3
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ADDED_MLS_PATH = os.path.join(PROJECT_ROOT, "temp", "added_mls.json")
+PHASE4_MAP_OUTPUT_PATH = os.path.join(PROJECT_ROOT, "temp", "phase4_mapped_hfmls.json")
 
 
 def _import_arcpy():
@@ -79,25 +82,16 @@ def _get_field_names(arcpy, dataset):
     )
 
 
-def _resolve_pmnum_field(arcpy, dataset):
-    field_names = _get_field_names(arcpy, dataset)
-    lowered = {name.lower(): name for name in field_names}
-    for candidate in PMNUM_FIELD_CANDIDATES:
-        if candidate.lower() in lowered:
-            return lowered[candidate.lower()]
-    raise RuntimeError(
-        f"Could not find a pmnum field in {dataset}. "
-        f"Tried: {', '.join(PMNUM_FIELD_CANDIDATES)}. "
-        f"Available fields: {field_names}"
-    )
+def _geom_to_temp_fc(arcpy, geom, name):
+    path = f"in_memory\\{name}"
+    if arcpy.Exists(path):
+        arcpy.management.Delete(path)
+    arcpy.management.CreateFeatureclass("in_memory", name, "POLYLINE", spatial_reference=geom.spatialReference)
+    with arcpy.da.InsertCursor(path, ["SHAPE@"]) as cursor:
+        cursor.insertRow([geom])
+    return path
 
 
-def _sql_literal(value):
-    return str(value).replace("'", "''")
-
-
-def _build_pmnum_query(field_name, pmnum):
-    return f"{field_name} = '{_sql_literal(pmnum)}'"
 
 
 def _require_dataset(arcpy, path, label, log_fn):
@@ -117,9 +111,17 @@ def _require_dataset(arcpy, path, label, log_fn):
     log_fn(f"{label}: {path}")
 
 
+def _require_write_lock(arcpy, path, label):
+    if not arcpy.TestSchemaLock(path):
+        raise RuntimeError(
+            f"{label} is locked and cannot be written: {path}. "
+            "Close ArcGIS Pro maps, attribute tables, edit sessions, Catalog previews, "
+            "or any other tools using this geodatabase, then rerun Phase 4."
+        )
+
+
 def _preflight_phase4(arcpy, config, log_fn):
     dataset_labels = [
-        ("PoC ML layer", config["p4_ml_layer_path"]),
         ("ML source", config["p4_ml_source_path"]),
         ("ML destination", config["p4_ml_dest_path"]),
         ("LL source", config["p4_ll_source_path"]),
@@ -130,30 +132,36 @@ def _preflight_phase4(arcpy, config, log_fn):
     for label, path in dataset_labels:
         _require_dataset(arcpy, path, label, log_fn)
 
-    ml_layer_pm_field = _resolve_pmnum_field(arcpy, config["p4_ml_layer_path"])
+    writable_targets = [
+        ("ML destination", config["p4_ml_dest_path"]),
+        ("LL destination", config["p4_ll_dest_path"]),
+        ("Parcels destination", config["p4_parcels_dest_path"]),
+    ]
+    for label, path in writable_targets:
+        _require_write_lock(arcpy, path, label)
+    log_fn("Phase 4 destination write locks available")
+
     ml_source_fields = _get_field_names(arcpy, config["p4_ml_source_path"])
     if "OBJECTID" not in ml_source_fields:
         raise RuntimeError(
             f"ML source is missing OBJECTID, which Phase 4 tracing requires: {config['p4_ml_source_path']}"
         )
-
-    log_fn(f"Resolved PoC ML id field: {ml_layer_pm_field}")
     log_fn(f"LL source field count: {len(_get_field_names(arcpy, config['p4_ll_source_path']))}")
     log_fn(f"LL destination field count: {len(_get_field_names(arcpy, config['p4_ll_dest_path']))}")
     log_fn(f"Parcels source field count: {len(_get_field_names(arcpy, config['p4_parcels_source_path']))}")
     log_fn(f"Parcels destination field count: {len(_get_field_names(arcpy, config['p4_parcels_dest_path']))}")
-    return ml_layer_pm_field
 
 
-def _build_network(arcpy, ml_source, ml_layer, log_fn):
+def _build_network_from_source(arcpy, ml_source, start_geom, log_fn):
     log_fn(f"Spatially filtering network within {BUFFER_DISTANCE} of target HFML...")
+    seed_fc = _geom_to_temp_fc(arcpy, start_geom, "_SeedGeomNet")
     _replace_temp_layer(arcpy, "_NetworkSource", ml_source)
     arcpy.management.SelectLayerByLocation(
-        "_NetworkSource", "WITHIN_A_DISTANCE", ml_layer,
+        "_NetworkSource", "WITHIN_A_DISTANCE", seed_fc,
         search_distance=BUFFER_DISTANCE,
         selection_type="NEW_SELECTION"
     )
-    arcpy.management.SelectLayerByAttribute(ml_layer, "CLEAR_SELECTION")
+    arcpy.management.Delete(seed_fc)
 
     network = {}
     geoms = {}
@@ -171,15 +179,12 @@ def _build_network(arcpy, ml_source, ml_layer, log_fn):
     return network, geoms
 
 
-def _get_seed_ml_geometry(arcpy, pmnum, ml_layer, pm_field_name):
-    arcpy.management.SelectLayerByAttribute(ml_layer, "NEW_SELECTION", _build_pmnum_query(pm_field_name, pmnum))
-    with arcpy.da.SearchCursor(ml_layer, ["SHAPE@"]) as cursor:
-        try:
-            return next(cursor)[0]
-        except StopIteration as exc:
-            raise RuntimeError(
-                f"PoC HFML pmnum {pmnum} was not found in {ml_layer} using field {pm_field_name}"
-            ) from exc
+def _make_seed_ml_layer_from_geom(arcpy, ml_source, start_geom):
+    seed_fc = _geom_to_temp_fc(arcpy, start_geom, "_SeedGeomLayer")
+    layer = _replace_temp_layer(arcpy, "_SeedHFML", ml_source)
+    arcpy.management.SelectLayerByLocation(layer, "INTERSECT", seed_fc, selection_type="NEW_SELECTION")
+    arcpy.management.Delete(seed_fc)
+    return layer
 
 
 def _trace_upstream(start_geom, network, geoms, blacklist, log_fn=None):
@@ -230,6 +235,14 @@ def _preview_oids(oid_list, limit=10):
     return f"[{preview}]"
 
 
+def _write_phase4_map_manifest(hfml_records, log_fn):
+    manifest = {"version": 1, "source": "phase4", "hfmls": hfml_records}
+    os.makedirs(os.path.dirname(PHASE4_MAP_OUTPUT_PATH), exist_ok=True)
+    with open(PHASE4_MAP_OUTPUT_PATH, "w") as f:
+        json.dump(manifest, f, indent=2)
+    log_fn(f"Phase 4 map manifest written: {PHASE4_MAP_OUTPUT_PATH}")
+
+
 def _build_ll_endpoint_table(arcpy, ll_layer, output_name="_TmpLLEndpoints"):
     output_path = f"in_memory\\{output_name}"
     if arcpy.Exists(output_path):
@@ -239,16 +252,20 @@ def _build_ll_endpoint_table(arcpy, ll_layer, output_name="_TmpLLEndpoints"):
     spatial_ref = ll_desc.spatialReference
     arcpy.management.CreateFeatureclass("in_memory", output_name, "POINT", spatial_reference=spatial_ref)
     arcpy.management.AddField(output_path, "LL_OID", "LONG")
+    arcpy.management.AddField(output_path, "END_ID", "LONG")
 
-    with arcpy.da.InsertCursor(output_path, ["SHAPE@", "LL_OID"]) as insert_cursor:
+    end_id = 1
+    with arcpy.da.InsertCursor(output_path, ["SHAPE@", "LL_OID", "END_ID"]) as insert_cursor:
         with arcpy.da.SearchCursor(ll_layer, ["OBJECTID", "SHAPE@"]) as search_cursor:
             for ll_oid, geom in search_cursor:
                 if geom is None:
                     continue
                 if geom.firstPoint is not None:
-                    insert_cursor.insertRow([arcpy.PointGeometry(geom.firstPoint, spatial_ref), ll_oid])
+                    insert_cursor.insertRow([arcpy.PointGeometry(geom.firstPoint, spatial_ref), ll_oid, end_id])
+                    end_id += 1
                 if geom.lastPoint is not None:
-                    insert_cursor.insertRow([arcpy.PointGeometry(geom.lastPoint, spatial_ref), ll_oid])
+                    insert_cursor.insertRow([arcpy.PointGeometry(geom.lastPoint, spatial_ref), ll_oid, end_id])
+                    end_id += 1
 
     return output_path
 
@@ -267,6 +284,7 @@ def _select_lls_contacting_mls(arcpy, ml_oid_list, ml_source, ll_source, seed_ml
         ml_layer = _replace_temp_layer(arcpy, "_TmpML", ml_source, query)
     ll_layer = _replace_temp_layer(arcpy, "_TmpLL", ll_source)
     candidate_ll_layer = None
+    endpoint_fc = None
     endpoint_layer = None
     try:
         selection_made = False
@@ -296,7 +314,8 @@ def _select_lls_contacting_mls(arcpy, ml_oid_list, ml_source, ll_source, seed_ml
         if log_fn:
             log_fn(f"Candidate LL count before endpoint filter: {_get_count(arcpy, candidate_ll_layer)}")
 
-        endpoint_layer = _build_ll_endpoint_table(arcpy, candidate_ll_layer)
+        endpoint_fc = _build_ll_endpoint_table(arcpy, candidate_ll_layer)
+        endpoint_layer = _replace_temp_layer(arcpy, "_TmpLLEndpointLayer", endpoint_fc)
         arcpy.management.SelectLayerByAttribute(endpoint_layer, "CLEAR_SELECTION")
 
         endpoint_selection_made = False
@@ -318,6 +337,9 @@ def _select_lls_contacting_mls(arcpy, ml_oid_list, ml_source, ll_source, seed_ml
                 selection_type="ADD_TO_SELECTION" if endpoint_selection_made else "NEW_SELECTION",
             )
 
+        if log_fn:
+            log_fn(f"LL endpoint hits after {LL_SEARCH_DISTANCE} filter: {_get_count(arcpy, endpoint_layer)}")
+
         ll_oids = sorted({row[0] for row in arcpy.da.SearchCursor(endpoint_layer, ["LL_OID"])})
         return ll_oids
     finally:
@@ -329,51 +351,118 @@ def _select_lls_contacting_mls(arcpy, ml_oid_list, ml_source, ll_source, seed_ml
             arcpy.management.Delete(candidate_ll_layer)
         if endpoint_layer is not None and arcpy.Exists(endpoint_layer):
             arcpy.management.Delete(endpoint_layer)
+        if endpoint_fc is not None and arcpy.Exists(endpoint_fc):
+            arcpy.management.Delete(endpoint_fc)
 
 
-def _make_seed_ml_layer(arcpy, ml_layer_path, pm_field_name, pmnum):
-    return _replace_temp_layer(
-        arcpy,
-        "_SeedHFML",
-        ml_layer_path,
-        _build_pmnum_query(pm_field_name, pmnum),
-    )
 
 
-def _select_parcels_intersecting_lls(arcpy, ll_oid_list, ll_source, parcels_source):
+def _copy_endpoint_subset(arcpy, source_layer, endpoint_ids, output_name="_TmpParcelSideEndpoints"):
+    output_path = f"in_memory\\{output_name}"
+    if arcpy.Exists(output_path):
+        arcpy.management.Delete(output_path)
+
+    source_desc = arcpy.Describe(source_layer)
+    spatial_ref = source_desc.spatialReference
+    arcpy.management.CreateFeatureclass("in_memory", output_name, "POINT", spatial_reference=spatial_ref)
+
+    endpoint_id_set = set(endpoint_ids)
+    with arcpy.da.InsertCursor(output_path, ["SHAPE@"]) as insert_cursor:
+        with arcpy.da.SearchCursor(source_layer, ["SHAPE@", "END_ID"]) as search_cursor:
+            for geom, end_id in search_cursor:
+                if end_id in endpoint_id_set:
+                    insert_cursor.insertRow([geom])
+
+    return output_path
+
+
+def _select_parcels_intersecting_lls(
+    arcpy,
+    ll_oid_list,
+    ll_source,
+    parcels_source,
+    ml_oid_list=None,
+    ml_source=None,
+    seed_ml_layer=None,
+    log_fn=None,
+):
     if not ll_oid_list:
         return []
     query = f"OBJECTID IN ({','.join(map(str, ll_oid_list))})"
     ll_layer = _replace_temp_layer(arcpy, "_TmpLL", ll_source, query)
     parcels_layer = _replace_temp_layer(arcpy, "_TmpParcels", parcels_source)
-    ll_endpoints = "in_memory\\ll_endpoints"
+    ml_layer = None
+    endpoint_fc = None
+    endpoint_layer = None
+    parcel_endpoint_fc = None
+    parcel_endpoint_layer = None
     try:
-        if arcpy.Exists(ll_endpoints):
-            arcpy.management.Delete(ll_endpoints)
+        endpoint_fc = _build_ll_endpoint_table(arcpy, ll_layer, "_TmpParcelLLEndpoints")
+        endpoint_layer = _replace_temp_layer(arcpy, "_TmpParcelLLEndpointLayer", endpoint_fc)
 
-        ll_desc = arcpy.Describe(ll_source)
-        spatial_ref = ll_desc.spatialReference
-        arcpy.management.CreateFeatureclass("in_memory", "ll_endpoints", "POINT", spatial_reference=spatial_ref)
+        endpoint_ids = {row[0] for row in arcpy.da.SearchCursor(endpoint_layer, ["END_ID"])}
+        ml_endpoint_ids = set()
+        selection_made = False
 
-        with arcpy.da.InsertCursor(ll_endpoints, ["SHAPE@"]) as insert_cursor:
-            with arcpy.da.SearchCursor(ll_layer, ["SHAPE@"]) as search_cursor:
-                for (geom,) in search_cursor:
-                    if geom is None or geom.lastPoint is None:
-                        continue
-                    endpoint = arcpy.PointGeometry(geom.lastPoint, spatial_ref)
-                    insert_cursor.insertRow([endpoint])
+        if ml_oid_list and ml_source:
+            ml_query = f"OBJECTID IN ({','.join(map(str, ml_oid_list))})"
+            ml_layer = _replace_temp_layer(arcpy, "_TmpParcelML", ml_source, ml_query)
+            arcpy.management.SelectLayerByLocation(
+                endpoint_layer,
+                "WITHIN_A_DISTANCE",
+                ml_layer,
+                search_distance=LL_SEARCH_DISTANCE,
+                selection_type="NEW_SELECTION",
+            )
+            selection_made = True
+
+        if seed_ml_layer is not None:
+            arcpy.management.SelectLayerByLocation(
+                endpoint_layer,
+                "WITHIN_A_DISTANCE",
+                seed_ml_layer,
+                search_distance=LL_SEARCH_DISTANCE,
+                selection_type="ADD_TO_SELECTION" if selection_made else "NEW_SELECTION",
+            )
+            selection_made = True
+
+        if selection_made:
+            ml_endpoint_ids = {row[0] for row in arcpy.da.SearchCursor(endpoint_layer, ["END_ID"])}
+
+        parcel_endpoint_ids = endpoint_ids - ml_endpoint_ids
+        if log_fn:
+            log_fn(f"LL parcel-side endpoint count: {len(parcel_endpoint_ids)}")
+
+        if not parcel_endpoint_ids:
+            return []
+
+        arcpy.management.SelectLayerByAttribute(endpoint_layer, "CLEAR_SELECTION")
+        parcel_endpoint_fc = _copy_endpoint_subset(arcpy, endpoint_layer, parcel_endpoint_ids)
+        parcel_endpoint_layer = _replace_temp_layer(
+            arcpy,
+            "_TmpParcelSideEndpointLayer",
+            parcel_endpoint_fc,
+        )
 
         arcpy.management.SelectLayerByLocation(
-            parcels_layer, "INTERSECT", ll_endpoints, selection_type="NEW_SELECTION"
+            parcels_layer, "INTERSECT", parcel_endpoint_layer, selection_type="NEW_SELECTION"
         )
         return [row[0] for row in arcpy.da.SearchCursor(parcels_layer, ["OBJECTID"])]
     finally:
+        if ml_layer is not None and arcpy.Exists(ml_layer):
+            arcpy.management.Delete(ml_layer)
         if arcpy.Exists(ll_layer):
             arcpy.management.Delete(ll_layer)
         if arcpy.Exists(parcels_layer):
             arcpy.management.Delete(parcels_layer)
-        if arcpy.Exists(ll_endpoints):
-            arcpy.management.Delete(ll_endpoints)
+        if endpoint_layer is not None and arcpy.Exists(endpoint_layer):
+            arcpy.management.Delete(endpoint_layer)
+        if endpoint_fc is not None and arcpy.Exists(endpoint_fc):
+            arcpy.management.Delete(endpoint_fc)
+        if parcel_endpoint_layer is not None and arcpy.Exists(parcel_endpoint_layer):
+            arcpy.management.Delete(parcel_endpoint_layer)
+        if parcel_endpoint_fc is not None and arcpy.Exists(parcel_endpoint_fc):
+            arcpy.management.Delete(parcel_endpoint_fc)
 
 
 def run(log_fn):
@@ -381,7 +470,6 @@ def run(log_fn):
     arcpy = _import_arcpy()
 
     config = load_config()
-    ml_layer_path  = config["p4_ml_layer_path"]
     ml_source      = config["p4_ml_source_path"]
     ml_dest        = config["p4_ml_dest_path"]
     ll_source      = config["p4_ll_source_path"]
@@ -394,49 +482,92 @@ def run(log_fn):
         raise RuntimeError(f"ArcGIS Pro license not available: {product_info}")
     log_fn(f"ArcGIS product license: {product_info}")
 
-    pm_field_name = _preflight_phase4(arcpy, config, log_fn)
+    _preflight_phase4(arcpy, config, log_fn)
 
-    ml_layer = _replace_temp_layer(arcpy, "_HFMLLayer", ml_layer_path)
-    seed_query = _build_pmnum_query(pm_field_name, POC_PMNUM)
+    pm_mainlines_path = config["feature_class_path"]
+    new_assetnums = {}
+    with arcpy.da.SearchCursor(pm_mainlines_path, [config["unique_id_field"], "assetnum", "new_flag"]) as cursor:
+        for row in cursor:
+            if row[2] == 1 and row[1] is not None:
+                new_assetnums[str(row[0])] = str(row[1])
 
-    log_fn(f"PoC — processing single HFML pmnum {POC_PMNUM}")
-    arcpy.management.SelectLayerByAttribute(ml_layer, "NEW_SELECTION", seed_query)
+    log_fn(f"Found {len(new_assetnums)} new HFMLs with new_flag=1")
 
-    log_fn("Indexing network and building geometry blacklist...")
-    arcpy.management.SelectLayerByAttribute(ml_layer, "CLEAR_SELECTION")
-    blacklist      = _build_blacklist(arcpy, ml_layer)
-    arcpy.management.SelectLayerByAttribute(ml_layer, "NEW_SELECTION", seed_query)
-    start_geom = _get_seed_ml_geometry(arcpy, POC_PMNUM, ml_layer, pm_field_name)
-    network, geoms = _build_network(arcpy, ml_source, ml_layer, log_fn)
+    if not new_assetnums:
+        log_fn("No new flagged HFMLs — Phase 4 complete")
+        _write_phase4_map_manifest([], log_fn)
+        return
 
-    ml_oids = _trace_upstream(start_geom, network, geoms, blacklist, log_fn)
-    log_fn(f"Traced ML count: {len(ml_oids)}")
-    log_fn(f"Traced ML OID preview: {_preview_oids(ml_oids)}")
-    _append_by_oids(arcpy, ml_oids, ml_source, ml_dest)
-    log_fn(f"Appended {len(ml_oids)} upstream ML segments")
+    assetnum_to_geom = {}
+    assetnum_set = set(new_assetnums.values())
+    with arcpy.da.SearchCursor(ml_source, ["MXASSETNUM", "SHAPE@"]) as cursor:
+        for row in cursor:
+            if str(row[0]) in assetnum_set and row[1] is not None:
+                assetnum_to_geom[str(row[0])] = row[1]
 
-    seed_ml_layer = _make_seed_ml_layer(arcpy, ml_layer_path, pm_field_name, POC_PMNUM)
-    try:
-        ll_oids = _select_lls_contacting_mls(
-            arcpy,
-            ml_oids,
-            ml_source,
-            ll_source,
-            seed_ml_layer=seed_ml_layer,
-            log_fn=log_fn,
-        )
-        log_fn(f"Selected LL count: {len(ll_oids)}")
-        log_fn(f"Selected LL OID preview: {_preview_oids(ll_oids)}")
-        _append_by_oids(arcpy, ll_oids, ll_source, ll_dest)
-        log_fn(f"Appended {len(ll_oids)} LLs contacting upstream MLs and the seed HFML")
-    finally:
-        if arcpy.Exists(seed_ml_layer):
-            arcpy.management.Delete(seed_ml_layer)
+    log_fn(f"Matched {len(assetnum_to_geom)}/{len(assetnum_set)} assetnums to geometry in ML source")
 
-    parcel_oids = _select_parcels_intersecting_lls(arcpy, ll_oids, ll_source, parcels_source)
-    log_fn(f"Selected parcel count: {len(parcel_oids)}")
-    log_fn(f"Selected parcel OID preview: {_preview_oids(parcel_oids)}")
-    _append_by_oids(arcpy, parcel_oids, parcels_source, parcels_dest)
-    log_fn(f"Appended {len(parcel_oids)} parcels intersecting LLs")
+    new_hfmls = []
+    for pmnum, assetnum in new_assetnums.items():
+        if assetnum in assetnum_to_geom:
+            new_hfmls.append({"pmnum": pmnum, "geom": assetnum_to_geom[assetnum]})
+        else:
+            log_fn(f"  pmnum {pmnum} assetnum {assetnum} has no geometry in ML source — skipping")
 
-    log_fn(f"Phase 4 PoC complete — pmnum {POC_PMNUM} processed")
+    if not new_hfmls:
+        log_fn("No new HFMLs resolved to geometry — Phase 4 complete")
+        _write_phase4_map_manifest([], log_fn)
+        return
+
+    blacklist = _build_blacklist(arcpy, ml_source)
+
+    hfml_records = []
+    for i, hfml in enumerate(new_hfmls, 1):
+        pmnum = hfml["pmnum"]
+        start_geom = hfml["geom"]
+        log_fn(f"--- HFML {i}/{len(new_hfmls)}: pmnum {pmnum} ---")
+
+        network, geoms = _build_network_from_source(arcpy, ml_source, start_geom, log_fn)
+
+        ml_oids = _trace_upstream(start_geom, network, geoms, blacklist, log_fn)
+        log_fn(f"Traced ML count: {len(ml_oids)}")
+        log_fn(f"Traced ML OID preview: {_preview_oids(ml_oids)}")
+        _append_by_oids(arcpy, ml_oids, ml_source, ml_dest)
+        log_fn(f"Appended {len(ml_oids)} upstream ML segments")
+
+        seed_ml_layer = _make_seed_ml_layer_from_geom(arcpy, ml_source, start_geom)
+        try:
+            ll_oids = _select_lls_contacting_mls(
+                arcpy, ml_oids, ml_source, ll_source,
+                seed_ml_layer=seed_ml_layer, log_fn=log_fn,
+            )
+            log_fn(f"Selected LL count: {len(ll_oids)}")
+            log_fn(f"Selected LL OID preview: {_preview_oids(ll_oids)}")
+            _append_by_oids(arcpy, ll_oids, ll_source, ll_dest)
+            log_fn(f"Appended {len(ll_oids)} LLs")
+
+            parcel_oids = _select_parcels_intersecting_lls(
+                arcpy, ll_oids, ll_source, parcels_source,
+                ml_oid_list=ml_oids, ml_source=ml_source,
+                seed_ml_layer=seed_ml_layer, log_fn=log_fn,
+            )
+            log_fn(f"Selected parcel count: {len(parcel_oids)}")
+            log_fn(f"Selected parcel OID preview: {_preview_oids(parcel_oids)}")
+            _append_by_oids(arcpy, parcel_oids, parcels_source, parcels_dest)
+            log_fn(f"Appended {len(parcel_oids)} parcels")
+
+            hfml_records.append({
+                "pmnum": pmnum,
+                "ml_oids": list(ml_oids),
+                "ll_oids": list(ll_oids),
+                "parcel_oids": list(parcel_oids),
+                "counts": {"ml": len(ml_oids), "ll": len(ll_oids), "parcels": len(parcel_oids)},
+            })
+        finally:
+            if arcpy.Exists(seed_ml_layer):
+                arcpy.management.Delete(seed_ml_layer)
+
+        log_fn(f"HFML {pmnum} complete")
+
+    _write_phase4_map_manifest(hfml_records, log_fn)
+    log_fn(f"Phase 4 complete — {len(hfml_records)} HFMLs processed")

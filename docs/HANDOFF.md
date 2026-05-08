@@ -56,7 +56,7 @@ Note: `arcpy` is not in requirements.txt — it comes from ArcGIS Pro's conda en
 
 ### Phase 4
 - Confirm `LL_SOURCE`, `LL_DEST`, `PARCELS_SOURCE`, `PARCELS_DEST` layer names in `backend/phase4/run.py`
-- Verify `BOUNDARY_TOUCHES` is the correct spatial relationship for LLs contacting MLs
+- LL contact uses `WITHIN_A_DISTANCE` plus endpoint filtering because LLs can have small gaps from MLs; tolerance is currently `1 Foot`
 
 ### Phase 5
 - Open the `.aprx` templates and confirm:
