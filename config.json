@@ -11,10 +11,10 @@
     "pdf_output_dir": "GIS/PDF_Output",
     "unique_id_field": "pmnum",
     "p4_ml_layer_path":       "GIS/Data.gdb/PMs_SSGRAVITYMAIN",
-    "p4_ml_source_path":      "GIS/Data.gdb/SASD_SSGRAVITYMAIN",
+    "p4_ml_source_path":      "\\\\pwnb1\\GISAccess\\Data\\SQL_WEB.gdb\\SASD_SSGRAVITYMAIN",
     "p4_ml_dest_path":        "GIS/Data.gdb/Trace_SSGRAVITYMAIN",
-    "p4_ll_source_path":      "GIS/Data.gdb/SASD_SSLATERALLINE",
+    "p4_ll_source_path":      "S:\\Agency_Collaboration\\GIS\\File_Geodatabases\\SASD.gdb\\SASD_SSLATERALLINE",
     "p4_ll_dest_path":        "GIS/Data.gdb/Lower_Laterals",
-    "p4_parcels_source_path": "GIS/Data.gdb/PARCELS",
+    "p4_parcels_source_path": "\\\\pwnb1\\GISAccess\\Data\\SQL_WEB.gdb\\PARCELS",
     "p4_parcels_dest_path":   "GIS/Data.gdb/Parcels_trace"
 }
