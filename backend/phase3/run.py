@@ -34,8 +34,8 @@ def _import_arcpy():
         return arcpy
     except Exception as exc:
         raise RuntimeError(
-            "ArcGIS Pro Python is not loading correctly. Launch the app with "
-            "launch.bat or run it from ArcGIS Pro's Python environment. "
+            "ArcGIS Pro Python is not loading correctly. Run the pipeline from "
+            "the SASD_HFML.pyt toolbox inside ArcGIS Pro. "
             f"Current interpreter: {sys.executable}. Original import error: {exc}"
         ) from exc
 
