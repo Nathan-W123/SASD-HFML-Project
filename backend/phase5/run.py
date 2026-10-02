@@ -5,6 +5,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 import json
 import re
 import shutil
+import traceback
 from datetime import date
 
 import pyodbc
@@ -771,6 +772,7 @@ def run(log_fn):
             exported += 1
         except Exception as _exp_exc:
             log_fn(f"  ERROR: export failed for HFML {hfml_id} — {_exp_exc}")
+            log_fn(traceback.format_exc())
             failed.append(hfml_id)
 
     if failed:
