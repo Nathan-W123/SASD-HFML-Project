@@ -74,8 +74,8 @@ PHASES = [
     ("phase1", "Import SQL query results into Excel",          run_phase1),
     ("phase2", "Detect ML changes and rebuild workbook",       run_phase2),
     ("phase3", "Sync Excel data to ArcGIS attribute table",    run_phase3),
-    ("phase4", "Append upstream features for new HFMLs",       run_phase4),
-    ("phase5", "Export PDF maps for new HFMLs",                run_phase5),
+    ("phase4", "Trace and map the next 5 new HFMLs",           run_phase4),
+    ("phase5", "Verify PDF maps from Phase 4",                 run_phase5),
 ]
 
 SUBPROCESS_PHASES = {"phase3", "phase4", "phase5"}

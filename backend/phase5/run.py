@@ -621,7 +621,7 @@ def _parse_observations(memo):
     return ", ".join(findings)
 
 
-def _fetch_observations(pmnum_list, config):
+def fetch_observations(pmnum_list, config):
     if not pmnum_list:
         return {}
     conn_str = (
@@ -675,7 +675,17 @@ def _load_phase4_manifest():
     return hfmls
 
 
-def _export_one(arcpy, hfml, config, today, observations_map, log_fn):
+def pdf_path_for(config, hfml_id):
+    return os.path.abspath(os.path.join(config["pdf_output_dir"], f"{hfml_id}.pdf"))
+
+
+def export_today():
+    return date.today().strftime("%B %d, %Y")
+
+
+def export_hfml_map(arcpy, hfml, config, today, observations_map, log_fn):
+    """Export the PDF map for one HFML.  Called by Phase 4 right after the
+    HFML's features are appended, before they are cleaned back out."""
     hfml_id = str(hfml["pmnum"])
     extent, target_point = _get_phase4_feature_info(arcpy, hfml, config, log_fn)
     layout_name, orientation = _select_template(extent, config)
@@ -720,7 +730,7 @@ def _export_one(arcpy, hfml, config, today, observations_map, log_fn):
             log_fn,
         )
 
-        pdf_path = os.path.abspath(os.path.join(config["pdf_output_dir"], f"{hfml_id}.pdf"))
+        pdf_path = pdf_path_for(config, hfml_id)
         if os.path.exists(pdf_path):
             try:
                 os.remove(pdf_path)
@@ -728,6 +738,7 @@ def _export_one(arcpy, hfml, config, today, observations_map, log_fn):
                 pass
         layout.exportToPDF(pdf_path)
         log_fn(f"Exported map for HFML {hfml_id} -> {pdf_path}")
+        return pdf_path
     finally:
         try:
             del aprx
@@ -740,40 +751,29 @@ def _export_one(arcpy, hfml, config, today, observations_map, log_fn):
 
 
 def run(log_fn):
-    arcpy = _import_arcpy()
+    # Maps are exported per HFML inside Phase 4 (trace -> export -> clean up),
+    # because the appended features are deleted once each map is saved.  This
+    # phase confirms every HFML Phase 4 mapped in its last run has its PDF.
     config = load_config()
-
-    product_info = arcpy.ProductInfo()
-    if product_info in {"NotInitialized", "Unavailable", "Engine", "ArcServer"}:
-        raise RuntimeError(f"ArcGIS Pro license not available: {product_info}")
-    log_fn(f"ArcGIS product license: {product_info}")
-
     hfmls = _load_phase4_manifest()
 
     if not hfmls:
-        log_fn("No new HFMLs to process - Phase 5 complete")
+        log_fn("Phase 4 mapped no HFMLs in its last run - Phase 5 complete")
         return
 
-    today = date.today().strftime("%B %d, %Y")
-
-    pmnum_list = [str(h["pmnum"]) for h in hfmls]
-    log_fn(f"Fetching Maximo memo observations for {len(pmnum_list)} PMs...")
-    observations_map = _fetch_observations(pmnum_list, config)
-    log_fn(f"Observations resolved for {len(observations_map)} PMs")
-
-    exported = 0
-    failed   = []
+    missing = []
     for hfml in hfmls:
         hfml_id = str(hfml["pmnum"])
-        log_fn(f"Generating map for HFML {hfml_id}...")
-        try:
-            _export_one(arcpy, hfml, config, today, observations_map, log_fn)
-            exported += 1
-        except Exception as _exp_exc:
-            log_fn(f"  ERROR: export failed for HFML {hfml_id} — {_exp_exc}")
-            failed.append(hfml_id)
+        pdf_path = pdf_path_for(config, hfml_id)
+        if os.path.exists(pdf_path):
+            log_fn(f"PDF found for HFML {hfml_id} -> {pdf_path}")
+        else:
+            log_fn(f"  ERROR: PDF missing for HFML {hfml_id} -> {pdf_path}")
+            missing.append(hfml_id)
 
-    if failed:
-        log_fn(f"Phase 5 complete — {exported} exported, {len(failed)} failed: {failed}")
-    else:
-        log_fn(f"Phase 5 complete — {exported} PDFs exported to {config['pdf_output_dir']}")
+    if missing:
+        raise RuntimeError(
+            f"{len(missing)} of {len(hfmls)} HFML maps are missing: {missing}. "
+            "Rerun Phase 4 to retrace and export them."
+        )
+    log_fn(f"Phase 5 complete — {len(hfmls)} PDFs verified in {config['pdf_output_dir']}")
