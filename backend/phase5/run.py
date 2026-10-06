@@ -5,6 +5,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 import json
 import re
 import shutil
+import subprocess
+import traceback
 from datetime import date
 
 import pyodbc
@@ -21,6 +23,9 @@ HORIZONTAL_LAYOUT_NAME = "Horizontal Layout"
 DATE_ELEMENT_NAME = "date"
 FIGURE_ELEMENT_NAME = "Figure"
 
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+EXPORT_JOB_PATH = os.path.join(PROJECT_ROOT, "temp", "phase5_export_job.json")
+
 MAP_BUFFER = 1.3
 MIN_MARGIN_INCHES = 0.5
 
@@ -31,8 +36,8 @@ def _import_arcpy():
         return arcpy
     except Exception as exc:
         raise RuntimeError(
-            "ArcGIS Pro Python is not loading correctly. Launch the app with "
-            "launch.bat or run it from ArcGIS Pro's Python environment. "
+            "ArcGIS Pro Python is not loading correctly. Run the pipeline from "
+            "the SASD_HFML.pyt toolbox inside ArcGIS Pro. "
             f"Current interpreter: {sys.executable}. Original import error: {exc}"
         ) from exc
 
@@ -748,6 +753,65 @@ def export_hfml_map(arcpy, hfml, config, today, observations_map, log_fn):
             os.remove(tmp_aprx)
         except Exception:
             pass
+
+
+def _python_exe():
+    # Inside Pro, sys.executable is ArcGISPro.exe; the active env's python.exe lives in sys.exec_prefix.
+    if os.path.basename(sys.executable).lower().startswith("python"):
+        return sys.executable
+    exe = os.path.join(sys.exec_prefix, "python.exe")
+    if not os.path.exists(exe):
+        raise RuntimeError(f"Could not find ArcGIS Pro's python.exe at {exe}")
+    return exe
+
+
+def export_hfml_map_out_of_process(hfml, config, log_fn):
+    """Export one HFML's map in a standalone Python process.
+
+    arcpy.mp layout export fails with "General Function Failure" when run
+    inside the ArcGIS Pro process (i.e. from the toolbox), so Phase 4 hands
+    each map to a separate python.exe and streams its output back.
+    """
+    hfml_id = str(hfml["pmnum"])
+    os.makedirs(os.path.dirname(EXPORT_JOB_PATH), exist_ok=True)
+    with open(EXPORT_JOB_PATH, "w") as f:
+        json.dump(hfml, f)
+
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    proc = subprocess.Popen(
+        [_python_exe(), "-u", "-c", "from backend.phase5.run import _run_export_job; _run_export_job()"],
+        cwd=PROJECT_ROOT,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    for line in proc.stdout:
+        line = line.rstrip()
+        if line:
+            log_fn(line)
+    if proc.wait() != 0:
+        raise RuntimeError(f"Map export for HFML {hfml_id} failed (exit code {proc.returncode})")
+    return pdf_path_for(config, hfml_id)
+
+
+def _run_export_job():
+    # Entry point for the standalone export process started above.
+    log_fn = lambda msg: print(msg, flush=True)
+    try:
+        with open(EXPORT_JOB_PATH, "r") as f:
+            hfml = json.load(f)
+        arcpy = _import_arcpy()
+        config = load_config()
+        hfml_id = str(hfml["pmnum"])
+        observations_map = fetch_observations([hfml_id], config)
+        export_hfml_map(arcpy, hfml, config, export_today(), observations_map, log_fn)
+    except Exception:
+        log_fn(traceback.format_exc())
+        raise SystemExit(1)
 
 
 def run(log_fn):

@@ -24,8 +24,8 @@ def _import_arcpy():
         return arcpy
     except Exception as exc:
         raise RuntimeError(
-            "ArcGIS Pro Python is not loading correctly. Launch the app with "
-            "launch.bat or run it from ArcGIS Pro's Python environment. "
+            "ArcGIS Pro Python is not loading correctly. Run the pipeline from "
+            "the SASD_HFML.pyt toolbox inside ArcGIS Pro. "
             f"Current interpreter: {sys.executable}. Original import error: {exc}"
         ) from exc
 
@@ -662,7 +662,7 @@ def _append_seed_to_hfml_layer(arcpy, seed_oid, ml_source, hfml_layer, pmnum, pm
 
 def run(log_fn):
     # Imported here: phase5 imports PHASE4_MAP_OUTPUT_PATH from this module.
-    from backend.phase5.run import export_hfml_map, export_today, fetch_observations, pdf_path_for
+    from backend.phase5.run import export_hfml_map_out_of_process, pdf_path_for
 
     log_fn(f"Phase 4 interpreter: {sys.executable}")
     arcpy = _import_arcpy()
@@ -752,7 +752,6 @@ def run(log_fn):
     blacklist = _build_blacklist(arcpy, ml_dest)
 
     log_fn(f"Mapping up to {MAX_HFMLS_PER_RUN} HFMLs this run")
-    today = export_today()
 
     dest_paths = [hfml_layer, ml_dest, ll_dest, parcels_dest]
     _write_phase4_map_manifest([], log_fn)
@@ -841,8 +840,7 @@ def run(log_fn):
                     arcpy.management.Delete(seed_ml_layer)
 
             log_fn(f"Exporting map for HFML {pmnum}...")
-            observations_map = fetch_observations([pmnum], config)
-            record["pdf_path"] = export_hfml_map(arcpy, record, config, today, observations_map, log_fn)
+            record["pdf_path"] = export_hfml_map_out_of_process(record, config, log_fn)
         except Exception as exc:
             log_fn(f"  ERROR: HFML {pmnum} failed — {exc}")
             failed.append(pmnum)

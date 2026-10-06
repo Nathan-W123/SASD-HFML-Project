@@ -87,7 +87,8 @@ Beta testing: only the first `MAX_HFMLS_PER_RUN` (5) new HFMLs are processed per
    - Recursively trace upstream and append the traced ML segments
    - Select and append LL features contacting those MLs
    - Select and append parcels at the LLs' parcel-side endpoints
-   - Export the PDF map for this HFML (Phase 5 export logic, below)
+   - Export the PDF map for this HFML (Phase 5 export logic, below). The export runs in a
+     standalone python.exe because `arcpy.mp` layout export fails inside the ArcGIS Pro process
    - Delete every row appended since the snapshot, so the destinations look as if
      Phase 4 never ran — only the PDF remains. Cleanup also runs if any step fails.
 3. Log: "Phase 4 complete — X HFMLs mapped" (the phase fails if any HFML failed)

@@ -4,21 +4,19 @@
 
 **Project structure**
 ```
-frontend/       — Streamlit UI
+SASD_HFML.pyt   — ArcGIS Pro Python Toolbox (Run HFML Pipeline tool)
 backend/        — phase1–5 scripts
 docs/           — CLAUDE.md, PIPELINE.md, this file
-.streamlit/     — dark theme config (must stay at project root)
 temp/           — runtime data passed between phases (gitignored)
 config.json     — all shared paths and SQL connection details
 config_loader.py — validates config.json on load
 requirements.txt — pip dependencies
-launch.bat      — Windows double-click launcher
 ```
 
-**Frontend**
-- `frontend/app.py` — dark-themed Streamlit UI: descriptive phase buttons, per-phase status badges, Run All at top (halts on failure), scrollable log panel, config validation warning on startup
+**Toolbox**
+- `SASD_HFML.pyt` — single "Run HFML Pipeline" geoprocessing tool: runs phases 1–5 in order inside ArcGIS Pro, logs to the Geoprocessing pane, halts on the first failure. Reloads backend modules on each run so code edits apply without restarting Pro.
 
-**Backend — all phases wired into app via `run(log_fn)` signature**
+**Backend — all phases wired into the toolbox via `run(log_fn)` signature**
 - `backend/phase1/run.py` — full skeleton: SQL query → CSV → Excel `import` sheet
 - `backend/phase2/run.py` — full skeleton: detect added MLs + frequency changes, append to mainlines, delete import sheet, write `temp/added_mls.json`
 - `backend/phase3/run.py` — skeleton: arcpy ExcelToTable + Append upsert with field mapping
@@ -31,20 +29,11 @@ launch.bat      — Windows double-click launcher
 
 ## How to run
 
-**Mac (no ArcGIS):**
-```
-cd "/path/to/SASD"
-python3 -m streamlit run frontend/app.py
-```
+In ArcGIS Pro: **Catalog > Toolboxes > Add Toolbox** > select `SASD_HFML.pyt`, then double-click **Run HFML Pipeline** and click **Run**.
 
-**Windows work machine:**
-Double-click `launch.bat` — no terminal needed.
+**Dependencies:** `pyodbc`, `pandas`, `openpyxl` (see `requirements.txt`) must be in ArcGIS Pro's active Python environment. Clone the default environment in **Settings > Package Manager**, add `pyodbc`, activate the clone, and restart Pro. `arcpy` comes with ArcGIS Pro.
 
-**Install dependencies:**
-```
-pip install -r requirements.txt
-```
-Note: `arcpy` is not in requirements.txt — it comes from ArcGIS Pro's conda environment, handled by `launch.bat`.
+Note: phases 3–5 require `arcpy`, so the pipeline can only be run end-to-end on a machine with ArcGIS Pro.
 
 ## What needs to be done on the work machine
 
@@ -70,8 +59,8 @@ Note: `arcpy` is not in requirements.txt — it comes from ArcGIS Pro's conda en
 - `excel_workbook_path` is constant and does not change monthly
 
 ## Key decisions
-- Each phase exposes `run(log_fn)` — output via callback, displayed in Streamlit log panel
+- Each phase exposes `run(log_fn)` — output via callback, wired to `arcpy.AddMessage` by the toolbox
 - Phases 2 → 4/5 communicate via `temp/added_mls.json` (gitignored, created at runtime)
 - All paths and credentials in `config.json`, never hardcoded
-- `.streamlit/config.toml` must stay at project root — Streamlit requires it
+- `SASD_HFML.pyt` must stay at project root — it adds the root to `sys.path` and `config.json` paths resolve relative to it
 - Removed MLs are intentionally ignored — only added MLs are appended
