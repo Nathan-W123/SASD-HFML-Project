@@ -74,22 +74,33 @@
 
 ---
 
-## Phase 4: Append ML, LL, and Parcels for New HFMLs
+## Phase 4: Trace, Map, and Clean Up New HFMLs
 
-1. Read the added HFMLs list produced in Phase 2
-2. For each new HFML in the list:
-   - Recursively trace upstream from the HFML, finding all ML segments that feed into it and all segments that feed into those, until no further upstream segments exist
-   - Append all traced upstream ML segments to the target ML dataset
-   - Select all LL features that contact the appended ML segments
-   - Append those LL features to the target LL dataset
-   - Select all parcel features that intersect the appended LL features
-   - Append those parcel features to the target parcels dataset
-   - Log counts for each step
-3. After all HFMLs processed, log: "Phase 4 complete — X new HFMLs processed"
+Beta testing: only the first `MAX_HFMLS_PER_RUN` (5) new HFMLs are processed per run
+(set in `backend/phase4/run.py`). An HFML counts as done once its PDF exists in
+`pdf_output_dir`, so each run picks up the next 5.
+
+1. Read the new HFMLs from PM_Mainlines (skipping any that already have a PDF)
+2. For each HFML, one at a time (Phase 4 and Phase 5 alternate per map):
+   - Snapshot the max OBJECTID of each destination (HFML layer, ML, LL, parcels)
+   - Append the HFML seed to the HFML layer
+   - Recursively trace upstream and append the traced ML segments
+   - Select and append LL features contacting those MLs
+   - Select and append parcels at the LLs' parcel-side endpoints
+   - Export the PDF map for this HFML (Phase 5 export logic, below)
+   - Delete every row appended since the snapshot, so the destinations look as if
+     Phase 4 never ran — only the PDF remains. Cleanup also runs if any step fails.
+3. Log: "Phase 4 complete — X HFMLs mapped" (the phase fails if any HFML failed)
 
 ---
 
-## Phase 5: Generate and Export PDF Maps
+## Phase 5: Verify PDF Maps
+
+Maps are exported inside Phase 4 (the traced features are deleted afterwards, so they
+cannot be exported later). Phase 5 checks that every HFML Phase 4 mapped in its last
+run has its PDF in `pdf_output_dir`, and fails if any are missing.
+
+The export logic (`export_hfml_map` in `backend/phase5/run.py`) works as follows:
 
 ### 5a. Determine Template Per HFML
 1. Read the list of newly appended HFMLs from Phase 4

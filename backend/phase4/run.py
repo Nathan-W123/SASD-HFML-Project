@@ -10,6 +10,9 @@ from config_loader import load_config
 BUFFER_DISTANCE = "50000 Feet"
 LL_SEARCH_DISTANCE = "1 Foot"
 ARCPY_RETRY_ATTEMPTS = 3
+# Beta testing: only map this many new HFMLs per run.  Raise (or remove) once
+# the full monthly batch should be processed.
+MAX_HFMLS_PER_RUN = 5
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 ADDED_MLS_PATH = os.path.join(PROJECT_ROOT, "temp", "added_mls.json")
 PHASE4_MAP_OUTPUT_PATH = os.path.join(PROJECT_ROOT, "temp", "phase4_mapped_hfmls.json")
@@ -321,6 +324,42 @@ def _preview_oids(oid_list, limit=10):
     return f"[{preview}]"
 
 
+def _get_max_oid(arcpy, path):
+    max_oid = 0
+    with arcpy.da.SearchCursor(path, ["OBJECTID"]) as cur:
+        for (oid,) in cur:
+            if oid > max_oid:
+                max_oid = oid
+    return max_oid
+
+
+def _snapshot_destinations(arcpy, dest_paths):
+    return {path: _get_max_oid(arcpy, path) for path in dest_paths}
+
+
+def _delete_rows_after(arcpy, path, max_oid):
+    def _delete():
+        deleted = 0
+        with arcpy.da.UpdateCursor(path, ["OBJECTID"], f"OBJECTID > {max_oid}") as cur:
+            for _ in cur:
+                cur.deleteRow()
+                deleted += 1
+        return deleted
+
+    return _with_arcpy_retry(arcpy, _delete, f"Failed to clean up appended rows in {path}")
+
+
+def _cleanup_destinations(arcpy, snapshot, log_fn):
+    """Remove every row appended since the snapshot so the destinations look
+    as if this HFML was never traced.  The exported PDF is the only output."""
+    for path, max_oid in snapshot.items():
+        try:
+            deleted = _delete_rows_after(arcpy, path, max_oid)
+            log_fn(f"  Cleaned up {deleted} row(s) from {path}")
+        except Exception as exc:
+            log_fn(f"  WARNING: cleanup failed for {path} — {exc}")
+
+
 def _write_phase4_map_manifest(hfml_records, log_fn):
     manifest = {"version": 1, "source": "phase4", "hfmls": hfml_records}
     os.makedirs(os.path.dirname(PHASE4_MAP_OUTPUT_PATH), exist_ok=True)
@@ -586,11 +625,7 @@ def _append_seed_to_hfml_layer(arcpy, seed_oid, ml_source, hfml_layer, pmnum, pm
             log_fn(f"  HFML seed for pmnum {pmnum} already in layer — skipping")
             return
 
-    max_oid = 0
-    with arcpy.da.SearchCursor(hfml_layer, ["OBJECTID"]) as cur:
-        for (oid,) in cur:
-            if oid > max_oid:
-                max_oid = oid
+    max_oid = _get_max_oid(arcpy, hfml_layer)
 
     _append_by_oids(arcpy, [seed_oid], ml_source, hfml_layer)
 
@@ -626,6 +661,9 @@ def _append_seed_to_hfml_layer(arcpy, seed_oid, ml_source, hfml_layer, pmnum, pm
 
 
 def run(log_fn):
+    # Imported here: phase5 imports PHASE4_MAP_OUTPUT_PATH from this module.
+    from backend.phase5.run import export_hfml_map, export_today, fetch_observations, pdf_path_for
+
     log_fn(f"Phase 4 interpreter: {sys.executable}")
     arcpy = _import_arcpy()
 
@@ -656,8 +694,10 @@ def run(log_fn):
 
     log_fn(f"Found {len(all_assetnums)} total HFMLs in PM_Mainlines")
 
-    # Determine which pmnums are already seeded in PMs_SSGRAVITYMAIN
-    already_done = set()
+    # Determine which pmnums are already done.  Each HFML's features are deleted
+    # after its map is exported, so an existing PDF is what marks it as mapped.
+    # Seeds left in PMs_SSGRAVITYMAIN by earlier runs also count.
+    already_done = {p for p in all_assetnums if os.path.exists(pdf_path_for(config, p))}
     try:
         with arcpy.da.SearchCursor(hfml_layer, ["PM_Mainlines_pmnum"]) as cursor:
             for (pmnum,) in cursor:
@@ -711,8 +751,17 @@ def run(log_fn):
     # by a previous run, not from the source (which would blacklist everything).
     blacklist = _build_blacklist(arcpy, ml_dest)
 
+    log_fn(f"Mapping up to {MAX_HFMLS_PER_RUN} HFMLs this run")
+    today = export_today()
+
+    dest_paths = [hfml_layer, ml_dest, ll_dest, parcels_dest]
+    _write_phase4_map_manifest([], log_fn)
     hfml_records = []
+    failed = []
     for i, hfml in enumerate(new_hfmls, 1):
+        if len(hfml_records) + len(failed) >= MAX_HFMLS_PER_RUN:
+            log_fn(f"Reached {MAX_HFMLS_PER_RUN}-HFML limit — remaining {len(new_hfmls) - i + 1} left for the next run")
+            break
         pmnum = hfml["pmnum"]
         start_geom = hfml["geom"]
         log_fn(f"--- HFML {i}/{len(new_hfmls)}: pmnum {pmnum} ---")
@@ -740,56 +789,77 @@ def run(log_fn):
             )
             continue
 
-        _append_seed_to_hfml_layer(arcpy, seed_oid, ml_source, config["p4_ml_layer_path"], pmnum, pm_mainlines_path, log_fn)
-
-        upstream_traced = _trace_upstream_directed(seed_oid, directed_net, geoms, pipe_ups, blacklist, log_fn)
-        ml_oids = [seed_oid] + upstream_traced
-        log_fn(f"Traced ML count (incl. seed): {len(ml_oids)}")
-        log_fn(f"Traced ML OID preview: {_preview_oids(ml_oids)}")
-        # Exclude the seed from the upstream ML trace layer — it belongs only
-        # in the HFML layer (already written above via _append_seed_to_hfml_layer).
-        upstream_ml_oids = [oid for oid in ml_oids if oid != seed_oid]
-        _append_by_oids(arcpy, upstream_ml_oids, ml_source, ml_dest)
-        log_fn(f"Appended {len(upstream_ml_oids)} upstream ML segments (seed excluded)")
-
-        seed_ml_layer = _make_seed_ml_layer_from_geom(arcpy, ml_source, start_geom)
+        # Snapshot destination OIDs so everything appended for this HFML can be
+        # removed once its map is exported (or if anything fails midway).
+        snapshot = _snapshot_destinations(arcpy, dest_paths)
         try:
-            ll_oids = _select_lls_contacting_mls(
-                arcpy, ml_oids, ml_source, ll_source,
-                seed_ml_layer=seed_ml_layer, log_fn=log_fn,
-            )
-            log_fn(f"Selected LL count: {len(ll_oids)}")
-            log_fn(f"Selected LL OID preview: {_preview_oids(ll_oids)}")
-            _append_by_oids(arcpy, ll_oids, ll_source, ll_dest)
-            log_fn(f"Appended {len(ll_oids)} LLs")
+            _append_seed_to_hfml_layer(arcpy, seed_oid, ml_source, config["p4_ml_layer_path"], pmnum, pm_mainlines_path, log_fn)
 
-            parcel_oids = _select_parcels_intersecting_lls(
-                arcpy, ll_oids, ll_source, parcels_source,
-                ml_oid_list=ml_oids, ml_source=ml_source,
-                seed_ml_layer=seed_ml_layer, log_fn=log_fn,
-            )
-            log_fn(f"Selected parcel count: {len(parcel_oids)}")
-            log_fn(f"Selected parcel OID preview: {_preview_oids(parcel_oids)}")
-            _append_by_oids(arcpy, parcel_oids, parcels_source, parcels_dest)
-            log_fn(f"Appended {len(parcel_oids)} parcels")
+            upstream_traced = _trace_upstream_directed(seed_oid, directed_net, geoms, pipe_ups, blacklist, log_fn)
+            ml_oids = [seed_oid] + upstream_traced
+            log_fn(f"Traced ML count (incl. seed): {len(ml_oids)}")
+            log_fn(f"Traced ML OID preview: {_preview_oids(ml_oids)}")
+            # Exclude the seed from the upstream ML trace layer — it belongs only
+            # in the HFML layer (already written above via _append_seed_to_hfml_layer).
+            upstream_ml_oids = [oid for oid in ml_oids if oid != seed_oid]
+            _append_by_oids(arcpy, upstream_ml_oids, ml_source, ml_dest)
+            log_fn(f"Appended {len(upstream_ml_oids)} upstream ML segments (seed excluded)")
 
-            hfml_records.append({
-                "pmnum": pmnum,
-                "seed_oid": seed_oid,
-                # ml_oids = upstream traced pipes only (seed is in the HFML layer,
-                # not in ml_dest, so it is tracked separately via seed_oid).
-                "ml_oids": list(upstream_ml_oids),
-                "ll_oids": list(ll_oids),
-                "parcel_oids": list(parcel_oids),
-                "counts": {"ml": len(upstream_ml_oids), "ll": len(ll_oids), "parcels": len(parcel_oids)},
-            })
-            # Write manifest after every HFML so Phase 5 can QC at any point,
-            # even if Phase 4 is stopped midway.
-            _write_phase4_map_manifest(hfml_records, log_fn)
+            seed_ml_layer = _make_seed_ml_layer_from_geom(arcpy, ml_source, start_geom)
+            try:
+                ll_oids = _select_lls_contacting_mls(
+                    arcpy, ml_oids, ml_source, ll_source,
+                    seed_ml_layer=seed_ml_layer, log_fn=log_fn,
+                )
+                log_fn(f"Selected LL count: {len(ll_oids)}")
+                log_fn(f"Selected LL OID preview: {_preview_oids(ll_oids)}")
+                _append_by_oids(arcpy, ll_oids, ll_source, ll_dest)
+                log_fn(f"Appended {len(ll_oids)} LLs")
+
+                parcel_oids = _select_parcels_intersecting_lls(
+                    arcpy, ll_oids, ll_source, parcels_source,
+                    ml_oid_list=ml_oids, ml_source=ml_source,
+                    seed_ml_layer=seed_ml_layer, log_fn=log_fn,
+                )
+                log_fn(f"Selected parcel count: {len(parcel_oids)}")
+                log_fn(f"Selected parcel OID preview: {_preview_oids(parcel_oids)}")
+                _append_by_oids(arcpy, parcel_oids, parcels_source, parcels_dest)
+                log_fn(f"Appended {len(parcel_oids)} parcels")
+
+                record = {
+                    "pmnum": pmnum,
+                    "seed_oid": seed_oid,
+                    # ml_oids = upstream traced pipes only (seed is in the HFML layer,
+                    # not in ml_dest, so it is tracked separately via seed_oid).
+                    "ml_oids": list(upstream_ml_oids),
+                    "ll_oids": list(ll_oids),
+                    "parcel_oids": list(parcel_oids),
+                    "counts": {"ml": len(upstream_ml_oids), "ll": len(ll_oids), "parcels": len(parcel_oids)},
+                }
+            finally:
+                if arcpy.Exists(seed_ml_layer):
+                    arcpy.management.Delete(seed_ml_layer)
+
+            log_fn(f"Exporting map for HFML {pmnum}...")
+            observations_map = fetch_observations([pmnum], config)
+            record["pdf_path"] = export_hfml_map(arcpy, record, config, today, observations_map, log_fn)
+        except Exception as exc:
+            log_fn(f"  ERROR: HFML {pmnum} failed — {exc}")
+            failed.append(pmnum)
+            continue
         finally:
-            if arcpy.Exists(seed_ml_layer):
-                arcpy.management.Delete(seed_ml_layer)
+            _cleanup_destinations(arcpy, snapshot, log_fn)
 
-        log_fn(f"HFML {pmnum} complete")
+        hfml_records.append(record)
+        # Write manifest after every HFML so Phase 5 can verify at any point,
+        # even if Phase 4 is stopped midway.
+        _write_phase4_map_manifest(hfml_records, log_fn)
+        log_fn(f"HFML {pmnum} complete — map saved, appended features removed")
 
-    log_fn(f"Phase 4 complete — {len(hfml_records)} HFMLs processed")
+    if failed:
+        raise RuntimeError(
+            f"{len(failed)} HFML(s) failed and were rolled back: {failed} "
+            f"({len(hfml_records)} mapped successfully)"
+        )
+    else:
+        log_fn(f"Phase 4 complete — {len(hfml_records)} HFMLs mapped")
