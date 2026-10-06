@@ -1,14 +1,13 @@
 # Project: Monthly GIS Pipeline Automation App
 
 ## Overview
-A locally-run Streamlit desktop application that automates a monthly 5-phase data pipeline involving SQL, Excel, and ArcGIS Pro. Each user runs the app on their own Windows machine with ArcGIS Pro installed. All data files live on a shared network drive.
+An ArcGIS Pro Python Toolbox (`SASD_HFML.pyt`) that automates a monthly 5-phase data pipeline involving SQL, Excel, and ArcGIS Pro. Each user runs the single **Run HFML Pipeline** tool from inside ArcGIS Pro on their own Windows machine. All data files live on a shared network drive.
 
 ## Tech Stack
-- **Frontend/UI:** Streamlit (runs locally in browser)
+- **UI:** ArcGIS Pro Python Toolbox — one tool, output in the Geoprocessing pane
 - **GIS:** ArcGIS Pro with `arcpy` (available via ArcGIS Pro's conda environment)
 - **Database:** SQL Server (single shared database, credentials in config)
 - **Excel:** `openpyxl` and/or `pandas`
-- **Launcher:** `.bat` file that activates ArcGIS Pro's conda environment and launches Streamlit
 - **Config:** `config.json` on the shared network drive for all shared paths and SQL connection details
 
 ## Pipeline Phases
@@ -27,14 +26,14 @@ Run sequentially by a single user. Each phase is a discrete Python subscript.
 - PDF output directory is a fixed shared folder defined in config
 
 ## Architecture Rules
-- Each phase is a separate Python function or subscript file, called from the main Streamlit app
-- The Streamlit app is a single-page UI with one button per phase plus a "Run All" button
-- All terminal/log output from each phase must be captured and displayed in a Streamlit log panel in real time
+- Each phase is a separate Python function or subscript file exposing `run(log_fn)`, called from the `SASD_HFML.pyt` toolbox
+- The toolbox has a single "Run HFML Pipeline" tool that runs all phases in order and halts on the first failure
+- All log output from each phase goes through `log_fn`, which the toolbox wires to `arcpy.AddMessage`
 - Phases must run sequentially — do not parallelize
-- Do not add web servers, APIs, or any remote hosting logic — this is local-only
+- Do not add web servers, APIs, or any remote hosting logic — this runs inside ArcGIS Pro
 
 ## ArcGIS / arcpy Rules
-- Always use the ArcGIS Pro conda Python environment — the `.bat` launcher handles environment activation
+- Code runs in ArcGIS Pro's active Python environment — `pyodbc` must be installed into a cloned environment via Package Manager
 - Use `arcpy` for all GIS operations — do not use open-source GIS libraries (geopandas, fiona, etc.)
 - Map template selection (vertical vs. horizontal) is determined programmatically based on data geometry fit — both `.aprx` templates already exist
 - Do not modify the `.aprx` template files — clone them per export
@@ -60,5 +59,5 @@ Run sequentially by a single user. Each phase is a discrete Python subscript.
 
 ## Distribution
 - The entire app folder lives on the shared network drive
-- Users launch via `launch.bat` — no CLI knowledge required
-- To update the app, replace files in the shared folder — no reinstall needed
+- Users add `SASD_HFML.pyt` to their ArcGIS Pro project via Catalog > Toolboxes > Add Toolbox
+- To update, replace files in the shared folder — the tool reloads backend modules on every run, so no Pro restart is needed
