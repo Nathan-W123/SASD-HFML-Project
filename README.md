@@ -7,7 +7,7 @@ An ArcGIS Pro Python Toolbox (`SASD_HFML.pyt`) that automates the monthly High F
 - **Phase 1** - Connect to SQL database, run query, export results, import into Excel as a new `import` sheet
 - **Phase 2** - Excel manipulation: detect added/removed MLs and frequency changes, rebuild the working sheet
 - **Phase 3** - Sync Excel data to ArcGIS attribute table via Excel To Table and Append with upsert logic
-- **Phase 4** - For the next 5 new HFMLs (beta limit), one at a time: trace and append upstream MLs, contacting LLs, and parcels; export that HFML's PDF map; then delete the appended features so only the PDF remains
+- **Phase 4** - For the next 5 new HFMLs (beta limit), one at a time: trace and append upstream MLs, contacting LLs, and parcels; export that HFML's PDF map and save the map as a project into a dated run folder (`PDF_Output/<YYYY-MM-DD HH-MM>/`, projects under `Temp GIS Maps/`); then delete the appended features
 - **Phase 5** - Verify every HFML mapped by Phase 4 has its PDF
 
 ## Project Structure

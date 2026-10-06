@@ -662,7 +662,9 @@ def _append_seed_to_hfml_layer(arcpy, seed_oid, ml_source, hfml_layer, pmnum, pm
 
 def run(log_fn):
     # Imported here: phase5 imports PHASE4_MAP_OUTPUT_PATH from this module.
-    from backend.phase5.run import export_hfml_map_out_of_process, pdf_path_for
+    from backend.phase5.run import (
+        export_hfml_map_out_of_process, find_mapped_pdfs, new_run_dir, run_output_paths,
+    )
 
     log_fn(f"Phase 4 interpreter: {sys.executable}")
     arcpy = _import_arcpy()
@@ -697,7 +699,8 @@ def run(log_fn):
     # Determine which pmnums are already done.  Each HFML's features are deleted
     # after its map is exported, so an existing PDF is what marks it as mapped.
     # Seeds left in PMs_SSGRAVITYMAIN by earlier runs also count.
-    already_done = {p for p in all_assetnums if os.path.exists(pdf_path_for(config, p))}
+    mapped_pdfs = find_mapped_pdfs(config)
+    already_done = {p for p in all_assetnums if p in mapped_pdfs}
     try:
         with arcpy.da.SearchCursor(hfml_layer, ["PM_Mainlines_pmnum"]) as cursor:
             for (pmnum,) in cursor:
@@ -752,6 +755,10 @@ def run(log_fn):
     blacklist = _build_blacklist(arcpy, ml_dest)
 
     log_fn(f"Mapping up to {MAX_HFMLS_PER_RUN} HFMLs this run")
+    # One folder per run holds the PDFs plus a "Temp GIS Maps" subfolder with
+    # each map saved as a project.  Created on the first export.
+    run_dir = new_run_dir(config)
+    log_fn(f"Run output folder: {run_dir}")
 
     dest_paths = [hfml_layer, ml_dest, ll_dest, parcels_dest]
     _write_phase4_map_manifest([], log_fn)
@@ -840,7 +847,8 @@ def run(log_fn):
                     arcpy.management.Delete(seed_ml_layer)
 
             log_fn(f"Exporting map for HFML {pmnum}...")
-            record["pdf_path"] = export_hfml_map_out_of_process(record, config, log_fn)
+            record["pdf_path"], record["draft_aprx_path"] = run_output_paths(run_dir, pmnum)
+            export_hfml_map_out_of_process(record, config, log_fn)
         except Exception as exc:
             log_fn(f"  ERROR: HFML {pmnum} failed — {exc}")
             failed.append(pmnum)
