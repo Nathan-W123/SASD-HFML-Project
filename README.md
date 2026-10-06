@@ -43,7 +43,7 @@ The pipeline runs inside ArcGIS Pro's Python environment, which needs `pyodbc`, 
 ### Running the pipeline
 
 1. In ArcGIS Pro, open the **Catalog** pane, right-click **Toolboxes > Add Toolbox**, and select `SASD_HFML.pyt`. Save the project to keep it there.
-2. Expand the toolbox and double-click **Run HFML Pipeline**, then click **Run**.
-3. Progress and log output appear in the Geoprocessing pane (and under **View Details** / Geoprocessing History). Phases run 1 through 5 in order; the tool stops at the first failed phase and reports the error.
+2. Expand the toolbox and double-click **Run HFML Pipeline**. All five phases are checked under **Phases to run**; uncheck any you want to skip (e.g. to rerun a single phase), then click **Run**.
+3. Progress and log output appear in the Geoprocessing pane (and under **View Details** / Geoprocessing History). Checked phases run in order 1 through 5; the tool stops at the first failed phase and reports the error.
 
 Edits to the backend scripts take effect on the next run without restarting Pro. After editing `SASD_HFML.pyt` itself, right-click the toolbox and choose **Refresh**.

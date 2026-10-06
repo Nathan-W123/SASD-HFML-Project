@@ -28,26 +28,51 @@ class Toolbox:
         self.tools = [RunPipeline]
 
 
+def _phase_choice(i, label):
+    return f"Phase {i}: {label}"
+
+
+PHASE_CHOICES = [_phase_choice(i, label) for i, (_, label) in enumerate(PHASES, 1)]
+
+
 class RunPipeline:
     def __init__(self):
         self.label = "Run HFML Pipeline"
-        self.description = "Runs phases 1-5 of the monthly HFML pipeline in order, halting on the first failure."
+        self.description = (
+            "Runs the selected phases of the monthly HFML pipeline in order (all five by default), "
+            "halting on the first failure."
+        )
         self.canRunInBackground = True
 
     def getParameterInfo(self):
-        return []
+        phases = arcpy.Parameter(
+            displayName="Phases to run",
+            name="phases",
+            datatype="GPString",
+            parameterType="Required",
+            direction="Input",
+            multiValue=True,
+        )
+        phases.filter.type = "ValueList"
+        phases.filter.list = PHASE_CHOICES
+        phases.values = PHASE_CHOICES
+        return [phases]
 
     def isLicensed(self):
         return True
 
     def execute(self, parameters, messages):
+        selected = set(parameters[0].values or [])
         # Pro keeps modules cached between runs; reload so code edits take effect without restarting Pro.
+        # Reload every phase (not just the selected ones) since Phase 4 imports helpers from Phase 5.
         importlib.reload(importlib.import_module("config_loader"))
-        for i, (module_name, label) in enumerate(PHASES, 1):
+        modules = [importlib.reload(importlib.import_module(name)) for name, _ in PHASES]
+        for i, ((_, label), module) in enumerate(zip(PHASES, modules), 1):
+            if _phase_choice(i, label) not in selected:
+                continue
             arcpy.SetProgressorLabel(f"Phase {i}: {label}")
             arcpy.AddMessage(f"=== Phase {i}: {label} ===")
             try:
-                module = importlib.reload(importlib.import_module(module_name))
                 module.run(arcpy.AddMessage)
             except Exception as exc:
                 arcpy.AddError(f"Phase {i} failed: {exc}")
