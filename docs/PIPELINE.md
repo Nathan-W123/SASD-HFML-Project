@@ -78,7 +78,15 @@
 
 Beta testing: only the first `MAX_HFMLS_PER_RUN` (5) new HFMLs are processed per run
 (set in `backend/phase4/run.py`). An HFML counts as done once its PDF exists in
-`pdf_output_dir`, so each run picks up the next 5.
+`pdf_output_dir` or one of its run folders, so each run picks up the next 5.
+
+Each run writes to its own folder:
+
+```
+<pdf_output_dir>/<YYYY-MM-DD HH-MM>/
+    <pmnum>.pdf                  one per HFML mapped this run
+    Temp GIS Maps/<pmnum>.aprx   the finished map saved as a project (zoom, filters, callout)
+```
 
 1. Read the new HFMLs from PM_Mainlines (skipping any that already have a PDF)
 2. For each HFML, one at a time (Phase 4 and Phase 5 alternate per map):
@@ -87,7 +95,8 @@ Beta testing: only the first `MAX_HFMLS_PER_RUN` (5) new HFMLs are processed per
    - Recursively trace upstream and append the traced ML segments
    - Select and append LL features contacting those MLs
    - Select and append parcels at the LLs' parcel-side endpoints
-   - Export the PDF map for this HFML (Phase 5 export logic, below). The export runs in a
+   - Export the PDF map and save the map as a project into the run folder (Phase 5 export
+     logic, below). The export runs in a
      standalone python.exe because `arcpy.mp` layout export fails inside the ArcGIS Pro process
    - Delete every row appended since the snapshot, so the destinations look as if
      Phase 4 never ran — only the PDF remains. Cleanup also runs if any step fails.
@@ -120,7 +129,7 @@ The export logic (`export_hfml_map` in `backend/phase5/run.py`) works as follows
    - Zoom the map frame extent to the HFML feature bounding box with a defined buffer margin
    - Update any dynamic text elements (title, date, HFML ID) if present in the template
    - Export the layout to PDF using `arcpy.mp.Layout.exportToPDF`
-   - Set output path to: `[pdf_output_dir from config]/[HFML_ID].pdf`
+   - Set output path to: `[pdf_output_dir]/[run folder]/[HFML_ID].pdf`, and save the project to `[run folder]/Temp GIS Maps/[HFML_ID].aprx`
    - Close and delete the temporary `.aprx` copy
    - Log: "Exported map for HFML [ID] → [filename].pdf"
 2. After all exports complete, log: "Phase 5 complete — X PDFs exported to [output directory]"

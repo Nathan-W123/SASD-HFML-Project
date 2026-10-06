@@ -7,7 +7,7 @@ import re
 import shutil
 import subprocess
 import traceback
-from datetime import date
+from datetime import date, datetime
 
 import pyodbc
 
@@ -25,6 +25,7 @@ FIGURE_ELEMENT_NAME = "Figure"
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 EXPORT_JOB_PATH = os.path.join(PROJECT_ROOT, "temp", "phase5_export_job.json")
+TEMP_GIS_MAPS_FOLDER = "Temp GIS Maps"
 
 MAP_BUFFER = 1.3
 MIN_MARGIN_INCHES = 0.5
@@ -680,8 +681,46 @@ def _load_phase4_manifest():
     return hfmls
 
 
-def pdf_path_for(config, hfml_id):
-    return os.path.abspath(os.path.join(config["pdf_output_dir"], f"{hfml_id}.pdf"))
+def new_run_dir(config):
+    """Folder for one pipeline run: <pdf_output_dir>/<YYYY-MM-DD HH-MM>."""
+    return os.path.join(
+        os.path.abspath(config["pdf_output_dir"]),
+        datetime.now().strftime("%Y-%m-%d %H-%M"),
+    )
+
+
+def run_output_paths(run_dir, hfml_id):
+    """PDF path and saved draft .aprx path for one HFML within a run folder."""
+    return (
+        os.path.join(run_dir, f"{hfml_id}.pdf"),
+        os.path.join(run_dir, TEMP_GIS_MAPS_FOLDER, f"{hfml_id}.aprx"),
+    )
+
+
+def find_mapped_pdfs(config):
+    """Return {pmnum: pdf_path} for PDFs already exported, either directly in
+    pdf_output_dir (older runs) or in one of its per-run folders."""
+    root = os.path.abspath(config["pdf_output_dir"])
+    found = {}
+    if not os.path.isdir(root):
+        return found
+
+    def _scan(folder):
+        for entry in os.scandir(folder):
+            if entry.is_file() and entry.name.lower().endswith(".pdf"):
+                found.setdefault(os.path.splitext(entry.name)[0], entry.path)
+            elif entry.is_dir() and folder == root:
+                _scan(entry.path)
+
+    _scan(root)
+    return found
+
+
+def _working_aprx_path(config, hfml_id):
+    # Scratch copy of the project, kept next to the original so its relative
+    # data paths still resolve.  The finished map is saved to the run folder.
+    aprx_dir = os.path.dirname(os.path.abspath(config["arcgis_project_path"]))
+    return os.path.join(aprx_dir, f"_phase5_{hfml_id}_tmp.aprx")
 
 
 def export_today():
@@ -696,10 +735,11 @@ def export_hfml_map(arcpy, hfml, config, today, observations_map, log_fn):
     layout_name, orientation = _select_template(extent, config)
     log_fn(f"Selected {orientation} layout for HFML {hfml_id}")
 
-    os.makedirs(config["pdf_output_dir"], exist_ok=True)
+    pdf_path = hfml["pdf_path"]
+    draft_aprx_path = hfml["draft_aprx_path"]
+    os.makedirs(os.path.dirname(pdf_path), exist_ok=True)
     aprx_src = os.path.abspath(config["arcgis_project_path"])
-    aprx_dir = os.path.dirname(aprx_src)
-    tmp_aprx = os.path.join(aprx_dir, f"_phase5_{hfml_id}_tmp.aprx")
+    tmp_aprx = _working_aprx_path(config, hfml_id)
     shutil.copy(aprx_src, tmp_aprx)
 
     try:
@@ -735,7 +775,6 @@ def export_hfml_map(arcpy, hfml, config, today, observations_map, log_fn):
             log_fn,
         )
 
-        pdf_path = pdf_path_for(config, hfml_id)
         if os.path.exists(pdf_path):
             try:
                 os.remove(pdf_path)
@@ -743,6 +782,17 @@ def export_hfml_map(arcpy, hfml, config, today, observations_map, log_fn):
                 pass
         layout.exportToPDF(pdf_path)
         log_fn(f"Exported map for HFML {hfml_id} -> {pdf_path}")
+
+        # Keep the finished map (camera, definition queries, callout) as a draft
+        # project so it can be opened and adjusted later.
+        try:
+            os.makedirs(os.path.dirname(draft_aprx_path), exist_ok=True)
+            if os.path.exists(draft_aprx_path):
+                os.remove(draft_aprx_path)
+            aprx.saveACopy(draft_aprx_path)
+            log_fn(f"Saved GIS map for HFML {hfml_id} -> {draft_aprx_path}")
+        except Exception as exc:
+            log_fn(f"  WARNING: could not save GIS map for HFML {hfml_id} — {exc}")
         return pdf_path
     finally:
         try:
@@ -793,9 +843,20 @@ def export_hfml_map_out_of_process(hfml, config, log_fn):
         line = line.rstrip()
         if line:
             log_fn(line)
-    if proc.wait() != 0:
-        raise RuntimeError(f"Map export for HFML {hfml_id} failed (exit code {proc.returncode})")
-    return pdf_path_for(config, hfml_id)
+    returncode = proc.wait()
+
+    # The export process holds the scratch project open until it exits, so its
+    # own cleanup can fail; remove it here now that the lock is released.
+    tmp_aprx = _working_aprx_path(config, hfml_id)
+    if os.path.exists(tmp_aprx):
+        try:
+            os.remove(tmp_aprx)
+        except Exception as exc:
+            log_fn(f"  WARNING: could not remove scratch project {tmp_aprx} — {exc}")
+
+    if returncode != 0:
+        raise RuntimeError(f"Map export for HFML {hfml_id} failed (exit code {returncode})")
+    return hfml["pdf_path"]
 
 
 def _run_export_job():
@@ -828,11 +889,11 @@ def run(log_fn):
     missing = []
     for hfml in hfmls:
         hfml_id = str(hfml["pmnum"])
-        pdf_path = pdf_path_for(config, hfml_id)
-        if os.path.exists(pdf_path):
+        pdf_path = hfml.get("pdf_path") or find_mapped_pdfs(config).get(hfml_id, "")
+        if pdf_path and os.path.exists(pdf_path):
             log_fn(f"PDF found for HFML {hfml_id} -> {pdf_path}")
         else:
-            log_fn(f"  ERROR: PDF missing for HFML {hfml_id} -> {pdf_path}")
+            log_fn(f"  ERROR: PDF missing for HFML {hfml_id} -> {pdf_path or 'no path recorded'}")
             missing.append(hfml_id)
 
     if missing:
@@ -840,4 +901,5 @@ def run(log_fn):
             f"{len(missing)} of {len(hfmls)} HFML maps are missing: {missing}. "
             "Rerun Phase 4 to retrace and export them."
         )
-    log_fn(f"Phase 5 complete — {len(hfmls)} PDFs verified in {config['pdf_output_dir']}")
+    run_dirs = sorted({os.path.dirname(h["pdf_path"]) for h in hfmls if h.get("pdf_path")})
+    log_fn(f"Phase 5 complete — {len(hfmls)} PDFs verified in {', '.join(run_dirs) or config['pdf_output_dir']}")
