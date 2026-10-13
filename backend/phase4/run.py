@@ -1,3 +1,4 @@
+import math
 import os
 import sys
 import time
@@ -9,6 +10,9 @@ from config_loader import load_config
 
 BUFFER_DISTANCE = "50000 Feet"
 LL_SEARCH_DISTANCE = "1 Foot"
+# Same distance in map units (feet), for excluding LLs that only tie in at the
+# HFML's downstream manhole.
+DOWNSTREAM_MANHOLE_TOLERANCE = 1.0
 ARCPY_RETRY_ATTEMPTS = 3
 # Beta testing: only map this many new HFMLs per run.  Raise (or remove) once
 # the full monthly batch should be processed.
@@ -260,14 +264,6 @@ def _trace_upstream_directed(seed_oid, directed_net, geoms, pipe_ups, blacklist,
     return to_append
 
 
-def _make_seed_ml_layer_from_geom(arcpy, ml_source, start_geom):
-    seed_fc = _geom_to_temp_fc(arcpy, start_geom, "_SeedGeomLayer")
-    layer = _replace_temp_layer(arcpy, "_SeedHFML", ml_source)
-    arcpy.management.SelectLayerByLocation(layer, "INTERSECT", seed_fc, selection_type="NEW_SELECTION")
-    arcpy.management.Delete(seed_fc)
-    return layer
-
-
 def _trace_upstream(start_geom, seed_oid, network, geoms, blacklist, log_fn=None):
     pt1 = (round(start_geom.firstPoint.X, 3), round(start_geom.firstPoint.Y, 3))
     pt2 = (round(start_geom.lastPoint.X,  3), round(start_geom.lastPoint.Y,  3))
@@ -399,7 +395,9 @@ def _get_count(arcpy, layer_or_table):
     return int(arcpy.management.GetCount(layer_or_table)[0])
 
 
-def _select_lls_contacting_mls(arcpy, ml_oid_list, ml_source, ll_source, seed_ml_layer=None, log_fn=None):
+def _select_lls_contacting_mls(
+    arcpy, ml_oid_list, ml_source, ll_source, seed_ml_layer=None, downstream_point=None, log_fn=None,
+):
     if not ml_oid_list and seed_ml_layer is None:
         return []
 
@@ -465,8 +463,25 @@ def _select_lls_contacting_mls(arcpy, ml_oid_list, ml_source, ll_source, seed_ml
         if log_fn:
             log_fn(f"LL endpoint hits after {LL_SEARCH_DISTANCE} filter: {_get_count(arcpy, endpoint_layer)}")
 
-        ll_oids = sorted({row[0] for row in arcpy.da.SearchCursor(endpoint_layer, ["LL_OID"])})
-        return ll_oids
+        hits = {}
+        with arcpy.da.SearchCursor(endpoint_layer, ["LL_OID", "SHAPE@XY"]) as cursor:
+            for ll_oid, (x, y) in cursor:
+                hits.setdefault(ll_oid, []).append((x, y))
+
+        # An LL whose only contact with the traced MLs is the HFML's downstream
+        # manhole drains downstream of the HFML, so it is not part of the trace.
+        if downstream_point is not None:
+            dn_x, dn_y = downstream_point
+            at_downstream = [
+                ll_oid for ll_oid, points in hits.items()
+                if all(math.hypot(x - dn_x, y - dn_y) <= DOWNSTREAM_MANHOLE_TOLERANCE for x, y in points)
+            ]
+            for ll_oid in at_downstream:
+                del hits[ll_oid]
+            if log_fn and at_downstream:
+                log_fn(f"Excluded {len(at_downstream)} LL(s) tied in only at the HFML's downstream manhole")
+
+        return sorted(hits)
     finally:
         if ml_layer is not None and arcpy.Exists(ml_layer):
             arcpy.management.Delete(ml_layer)
@@ -657,7 +672,13 @@ def _append_seed_to_hfml_layer(arcpy, seed_oid, ml_source, hfml_layer, pmnum, pm
                     row[2] = frequency
                 cur.updateRow(row)
                 updated += 1
-    log_fn(f"  HFML seed appended for pmnum {pmnum}, frequency={frequency} ({updated} row(s))")
+    if freq_layer_field and frequency is not None:
+        freq_note = f"{freq_layer_field}={frequency}"
+    elif not freq_layer_field:
+        freq_note = "frequency NOT stamped — HFML layer has no 'frequency' field"
+    else:
+        freq_note = "frequency NOT stamped — no frequency found in PM_Mainlines"
+    log_fn(f"  HFML seed appended for pmnum {pmnum}, {freq_note} ({updated} row(s))")
 
 
 def run(log_fn):
@@ -815,40 +836,38 @@ def run(log_fn):
             _append_by_oids(arcpy, upstream_ml_oids, ml_source, ml_dest)
             log_fn(f"Appended {len(upstream_ml_oids)} upstream ML segments (seed excluded)")
 
-            seed_ml_layer = _make_seed_ml_layer_from_geom(arcpy, ml_source, start_geom)
-            try:
-                ll_oids = _select_lls_contacting_mls(
-                    arcpy, ml_oids, ml_source, ll_source,
-                    seed_ml_layer=seed_ml_layer, log_fn=log_fn,
-                )
-                log_fn(f"Selected LL count: {len(ll_oids)}")
-                log_fn(f"Selected LL OID preview: {_preview_oids(ll_oids)}")
-                _append_by_oids(arcpy, ll_oids, ll_source, ll_dest)
-                log_fn(f"Appended {len(ll_oids)} LLs")
+            # LLs are found from the HFML and its upstream MLs only (ml_oids).
+            # Selecting by the pipes that touch the HFML would also pull in the
+            # downstream ML's laterals and parcels.  The HFML's downstream end is
+            # its lastPoint (digitizing convention, as used by the trace).
+            ll_oids = _select_lls_contacting_mls(
+                arcpy, ml_oids, ml_source, ll_source,
+                downstream_point=(geoms[seed_oid][2], geoms[seed_oid][3]), log_fn=log_fn,
+            )
+            log_fn(f"Selected LL count: {len(ll_oids)}")
+            log_fn(f"Selected LL OID preview: {_preview_oids(ll_oids)}")
+            _append_by_oids(arcpy, ll_oids, ll_source, ll_dest)
+            log_fn(f"Appended {len(ll_oids)} LLs")
 
-                parcel_oids = _select_parcels_intersecting_lls(
-                    arcpy, ll_oids, ll_source, parcels_source,
-                    ml_oid_list=ml_oids, ml_source=ml_source,
-                    seed_ml_layer=seed_ml_layer, log_fn=log_fn,
-                )
-                log_fn(f"Selected parcel count: {len(parcel_oids)}")
-                log_fn(f"Selected parcel OID preview: {_preview_oids(parcel_oids)}")
-                _append_by_oids(arcpy, parcel_oids, parcels_source, parcels_dest)
-                log_fn(f"Appended {len(parcel_oids)} parcels")
+            parcel_oids = _select_parcels_intersecting_lls(
+                arcpy, ll_oids, ll_source, parcels_source,
+                ml_oid_list=ml_oids, ml_source=ml_source, log_fn=log_fn,
+            )
+            log_fn(f"Selected parcel count: {len(parcel_oids)}")
+            log_fn(f"Selected parcel OID preview: {_preview_oids(parcel_oids)}")
+            _append_by_oids(arcpy, parcel_oids, parcels_source, parcels_dest)
+            log_fn(f"Appended {len(parcel_oids)} parcels")
 
-                record = {
-                    "pmnum": pmnum,
-                    "seed_oid": seed_oid,
-                    # ml_oids = upstream traced pipes only (seed is in the HFML layer,
-                    # not in ml_dest, so it is tracked separately via seed_oid).
-                    "ml_oids": list(upstream_ml_oids),
-                    "ll_oids": list(ll_oids),
-                    "parcel_oids": list(parcel_oids),
-                    "counts": {"ml": len(upstream_ml_oids), "ll": len(ll_oids), "parcels": len(parcel_oids)},
-                }
-            finally:
-                if arcpy.Exists(seed_ml_layer):
-                    arcpy.management.Delete(seed_ml_layer)
+            record = {
+                "pmnum": pmnum,
+                "seed_oid": seed_oid,
+                # ml_oids = upstream traced pipes only (seed is in the HFML layer,
+                # not in ml_dest, so it is tracked separately via seed_oid).
+                "ml_oids": list(upstream_ml_oids),
+                "ll_oids": list(ll_oids),
+                "parcel_oids": list(parcel_oids),
+                "counts": {"ml": len(upstream_ml_oids), "ll": len(ll_oids), "parcels": len(parcel_oids)},
+            }
 
             log_fn(f"Exporting map for HFML {pmnum}...")
             record["pdf_path"], record["draft_aprx_path"] = run_output_paths(run_dir, pmnum)

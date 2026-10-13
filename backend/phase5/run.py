@@ -297,6 +297,53 @@ def _scope_layers(arcpy, map_obj, hfml_id, content_extent=None, log_fn=None):
                     log_fn(f"  WARNING: could not filter layer '{layer.name}' — showing all features: {_scope_exc}")
 
 
+def _norm_path(path):
+    return os.path.normcase(os.path.normpath(str(path or ""))).rstrip("\\/")
+
+
+def _log_layer_report(arcpy, map_obj, hfml_id, config, log_fn):
+    """Log what each HFML/trace layer in the map points at and how many features
+    it will draw, so a map missing the HFML or MLs shows why in the log."""
+    expected = {
+        _norm_path(config["p4_ml_layer_path"]): "HFML layer",
+        _norm_path(config["p4_ml_dest_path"]): "ML trace",
+        _norm_path(config["p4_ll_dest_path"]): "LL trace",
+        _norm_path(config["p4_parcels_dest_path"]): "parcels trace",
+    }
+    seen = set()
+    for layer in map_obj.listLayers():
+        if layer.isGroupLayer or not layer.supports("DATASOURCE"):
+            continue
+        try:
+            source = layer.dataSource
+        except Exception:
+            continue
+        role = expected.get(_norm_path(source))
+        is_hfml_name = layer.name == HFML_LAYER_NAME
+        if role is None and not is_hfml_name:
+            continue
+        seen.add(role)
+        try:
+            count = sum(1 for _ in arcpy.da.SearchCursor(layer, ["OID@"]))
+        except Exception as exc:
+            count = f"? ({exc})"
+        query = layer.definitionQuery if layer.supports("DEFINITIONQUERY") else ""
+        renderer = ""
+        try:
+            r = layer.symbology.renderer
+            fields = getattr(r, "fields", None)
+            renderer = f", symbology={r.type}" + (f" on {fields}" if fields else "")
+        except Exception:
+            pass
+        log_fn(
+            f"  Layer '{layer.name}' [{role or 'NOT a Phase 4 output'}] draws {count} feature(s)"
+            f"{renderer}; query={query!r}; source={source}"
+        )
+    for path, role in expected.items():
+        if role not in seen:
+            log_fn(f"  WARNING: no layer in map '{map_obj.name}' reads the {role} ({path}) — those features won't appear")
+
+
 def _page_xy_from_map_point(map_frame, point):
     extent = map_frame.camera.getExtent()
     if extent is None:
@@ -789,6 +836,7 @@ def export_hfml_map(arcpy, hfml, config, today, observations_map, log_fn):
         map_obj.referenceScale = 0  # disable scale-dependent symbol sizing
         _apply_camera_extent(arcpy, map_frame, extent, log_fn)
         _scope_layers(arcpy, map_obj, hfml_id, map_frame.camera.getExtent(), log_fn)
+        _log_layer_report(arcpy, map_obj, hfml_id, config, log_fn)
         gridno = _lookup_gridno(arcpy, config, hfml_id)
         _set_text_elements(layout, hfml_id, gridno, today, log_fn)
         _try_add_callout(
