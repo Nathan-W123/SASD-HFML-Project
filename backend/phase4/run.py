@@ -663,7 +663,8 @@ def _append_seed_to_hfml_layer(arcpy, seed_oid, ml_source, hfml_layer, pmnum, pm
 def run(log_fn):
     # Imported here: phase5 imports PHASE4_MAP_OUTPUT_PATH from this module.
     from backend.phase5.run import (
-        export_hfml_map_out_of_process, find_mapped_pdfs, new_run_dir, run_output_paths,
+        export_hfml_map_out_of_process, find_mapped_pdfs, new_run_dir, resolve_project_path,
+        run_output_paths,
     )
 
     log_fn(f"Phase 4 interpreter: {sys.executable}")
@@ -683,6 +684,9 @@ def run(log_fn):
     log_fn(f"ArcGIS product license: {product_info}")
 
     _preflight_phase4(arcpy, config, log_fn)
+    # Resolve the map project up front so a bad path fails before any tracing.
+    aprx_path = resolve_project_path(config, log_fn)
+    log_fn(f"Map project: {aprx_path}")
 
     hfml_layer = config["p4_ml_layer_path"]
 
@@ -848,6 +852,7 @@ def run(log_fn):
 
             log_fn(f"Exporting map for HFML {pmnum}...")
             record["pdf_path"], record["draft_aprx_path"] = run_output_paths(run_dir, pmnum)
+            record["aprx_path"] = aprx_path
             export_hfml_map_out_of_process(record, config, log_fn)
         except Exception as exc:
             log_fn(f"  ERROR: HFML {pmnum} failed — {exc}")
