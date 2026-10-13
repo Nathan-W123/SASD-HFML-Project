@@ -34,20 +34,6 @@ def _import_arcpy():
         ) from exc
 
 
-def _build_blacklist(arcpy, ml_layer):
-    blacklist = set()
-    with arcpy.da.SearchCursor(ml_layer, ["SHAPE@"]) as cursor:
-        for row in cursor:
-            geom = row[0]
-            if geom is None:
-                continue
-            fp = (round(geom.firstPoint.X, 3), round(geom.firstPoint.Y, 3),
-                  round(geom.lastPoint.X, 3), round(geom.lastPoint.Y, 3))
-            blacklist.add(fp)
-            blacklist.add((fp[2], fp[3], fp[0], fp[1]))
-    return blacklist
-
-
 def _clear_workspace_cache(arcpy):
     try:
         arcpy.management.ClearWorkspaceCache()
@@ -229,9 +215,12 @@ def _build_directed_network(arcpy, ml_source, start_geom, log_fn):
     return directed_net, geoms, pipe_ups
 
 
-def _trace_upstream_directed(seed_oid, directed_net, geoms, pipe_ups, blacklist, log_fn=None):
+def _trace_upstream_directed(seed_oid, directed_net, geoms, pipe_ups, log_fn=None):
     """DFS upstream through a directed network.  Can only travel upstream because
     directed_net only contains edges in the upstream direction.
+
+    Every map is cleaned up after export, so pipes already present in the
+    destination (e.g. from older runs) are traced through like any other.
     """
     if seed_oid is None:
         if log_fn:
@@ -248,50 +237,31 @@ def _trace_upstream_directed(seed_oid, directed_net, geoms, pipe_ups, blacklist,
     to_append = []
     stack     = [seed_up_key]
 
+    visited_keys = set()
     while stack:
         key = stack.pop()
+        visited_keys.add(key)
         for feat_id, up_key in directed_net.get(key, []):
             if feat_id in visited:
                 continue
             visited.add(feat_id)
-            if geoms[feat_id] in blacklist:
-                continue
             to_append.append(feat_id)
             stack.append(up_key)
 
     if log_fn:
         log_fn(f"Upstream trace found {len(to_append)} pipes from seed upstream key {seed_up_key!r}")
-    return to_append
-
-
-def _trace_upstream(start_geom, seed_oid, network, geoms, blacklist, log_fn=None):
-    pt1 = (round(start_geom.firstPoint.X, 3), round(start_geom.firstPoint.Y, 3))
-    pt2 = (round(start_geom.lastPoint.X,  3), round(start_geom.lastPoint.Y,  3))
-
-    # With the bidirectional network each pipe appears under both its endpoints.
-    # Pre-add the seed so the DFS cannot cross through it and reach downstream
-    # pipes.  Count only non-seed connections to pick the upstream endpoint.
-    visited = {seed_oid} if seed_oid is not None else set()
-    hits1 = sum(1 for fid, _ in network.get(pt1, []) if fid != seed_oid)
-    hits2 = sum(1 for fid, _ in network.get(pt2, []) if fid != seed_oid)
-    search_pt = pt1 if hits1 >= hits2 else pt2
-    if log_fn:
-        log_fn(f"Trace pt1 non-seed hits: {hits1}, pt2 non-seed hits: {hits2} — tracing from {'firstPoint' if search_pt == pt1 else 'lastPoint'}")
-
-    to_append = []
-    stack     = [search_pt]
-
-    while stack:
-        pt = stack.pop()
-        for feat_id, other_pt in network.get(pt, []):
-            if feat_id in visited:
-                continue
-            visited.add(feat_id)
-            if geoms[feat_id] in blacklist:
-                continue
-            to_append.append(feat_id)
-            stack.append(other_pt)
-
+        # Pipes that START at a traced node flow away from it.  Apart from real
+        # flow splits, these are usually pipes digitized against the flow, which
+        # the trace can't follow — list them so a missing branch can be checked.
+        outflow = sorted(
+            oid for oid, up_key in pipe_ups.items()
+            if up_key in visited_keys and oid not in visited
+        )
+        if outflow:
+            log_fn(
+                f"  NOTE: {len(outflow)} pipe(s) start at a traced manhole and were not followed "
+                f"(possibly digitized against flow): {_preview_oids(outflow)}"
+            )
     return to_append
 
 
@@ -648,37 +618,69 @@ def _append_seed_to_hfml_layer(arcpy, seed_oid, ml_source, hfml_layer, pmnum, pm
         log_fn(f"  HFML seed appended for pmnum {pmnum} ('{pmnum_field}' not found — attributes not stamped)")
         return
 
-    # Stamp pmnum and copy frequency from PM_Mainlines so symbology works.
-    frequency = None
+    # Stamp pmnum and copy the PM_Mainlines attributes (frequency etc.) onto the
+    # seed so the layer's symbology classifies it.  HFML layer fields are matched
+    # as PM_Mainlines_<field> (joined export naming) or a bare 'frequency'.
+    layer_field_info = {f.name.lower(): f for f in arcpy.ListFields(hfml_layer)}
+    pm_values = {}
     try:
-        pm_fields = [f.name for f in arcpy.ListFields(pm_mainlines_path)]
-        freq_field = next((f for f in pm_fields if f.lower() == "frequency"), None)
-        if freq_field:
-            with arcpy.da.SearchCursor(pm_mainlines_path, [freq_field], f"pmnum = '{pmnum}'") as cur:
-                for (val,) in cur:
-                    frequency = val
-                    break
-    except Exception:
-        pass
+        pm_fields = [
+            f.name for f in arcpy.ListFields(pm_mainlines_path)
+            if f.type not in ("OID", "Geometry", "GlobalID", "Blob", "Raster")
+        ]
+        with arcpy.da.SearchCursor(pm_mainlines_path, pm_fields, f"pmnum = '{pmnum}'") as cur:
+            for row in cur:
+                pm_values = dict(zip(pm_fields, row))
+                break
+    except Exception as exc:
+        log_fn(f"  WARNING: could not read PM_Mainlines attributes for pmnum {pmnum} — {exc}")
 
-    freq_layer_field = next((f for f in _get_field_names(arcpy, hfml_layer) if f.lower() == "frequency"), None)
-    update_fields = ["OBJECTID", pmnum_field] + ([freq_layer_field] if freq_layer_field and frequency is not None else [])
+    copies = {}
+    for pm_field, value in pm_values.items():
+        for candidate in (f"pm_mainlines_{pm_field.lower()}",) + (("frequency",) if pm_field.lower() == "frequency" else ()):
+            layer_field = layer_field_info.get(candidate)
+            if layer_field is not None and layer_field.name != pmnum_field and layer_field.editable:
+                copies[layer_field.name] = _coerce_for_field(value, layer_field.type)
+    copies[pmnum_field] = _coerce_for_field(pmnum, layer_field_info[pmnum_field.lower()].type)
+
+    update_fields = ["OBJECTID"] + list(copies)
     updated = 0
     with arcpy.da.UpdateCursor(hfml_layer, update_fields) as cur:
         for row in cur:
             if row[0] > max_oid:
-                row[1] = pmnum
-                if freq_layer_field and frequency is not None:
-                    row[2] = frequency
-                cur.updateRow(row)
+                cur.updateRow([row[0]] + list(copies.values()))
                 updated += 1
-    if freq_layer_field and frequency is not None:
-        freq_note = f"{freq_layer_field}={frequency}"
-    elif not freq_layer_field:
-        freq_note = "frequency NOT stamped — HFML layer has no 'frequency' field"
+
+    freq_fields = [f for f in copies if "frequency" in f.lower()]
+    if freq_fields:
+        freq_note = ", ".join(f"{f}={copies[f]!r}" for f in freq_fields)
+    elif not pm_values:
+        freq_note = "attributes NOT copied — pmnum not found in PM_Mainlines"
     else:
-        freq_note = "frequency NOT stamped — no frequency found in PM_Mainlines"
-    log_fn(f"  HFML seed appended for pmnum {pmnum}, {freq_note} ({updated} row(s))")
+        freq_note = "frequency NOT stamped — HFML layer has no PM_Mainlines_frequency/frequency field"
+    log_fn(
+        f"  HFML seed appended for pmnum {pmnum}, {freq_note} "
+        f"({len(copies)} field(s) copied, {updated} row(s))"
+    )
+
+
+def _coerce_for_field(value, field_type):
+    """Convert a value to suit the destination field, so e.g. a frequency of
+    6.0 is written as '6' to a text field and matches a symbology class '6'."""
+    if value is None:
+        return None
+    try:
+        if field_type == "String":
+            if isinstance(value, float) and value.is_integer():
+                return str(int(value))
+            return str(value)
+        if field_type in ("Integer", "SmallInteger", "BigInteger"):
+            return int(float(value))
+        if field_type in ("Double", "Single"):
+            return float(value)
+    except (TypeError, ValueError):
+        return None
+    return value
 
 
 def run(log_fn):
@@ -775,10 +777,6 @@ def run(log_fn):
         _write_phase4_map_manifest([], log_fn)
         return
 
-    # Blacklist from the destination — prevents re-appending pipes already written
-    # by a previous run, not from the source (which would blacklist everything).
-    blacklist = _build_blacklist(arcpy, ml_dest)
-
     log_fn(f"Mapping up to {MAX_HFMLS_PER_RUN} HFMLs this run")
     # One folder per run holds the PDFs plus a "Temp GIS Maps" subfolder with
     # each map saved as a project.  Created on the first export.
@@ -826,7 +824,7 @@ def run(log_fn):
         try:
             _append_seed_to_hfml_layer(arcpy, seed_oid, ml_source, config["p4_ml_layer_path"], pmnum, pm_mainlines_path, log_fn)
 
-            upstream_traced = _trace_upstream_directed(seed_oid, directed_net, geoms, pipe_ups, blacklist, log_fn)
+            upstream_traced = _trace_upstream_directed(seed_oid, directed_net, geoms, pipe_ups, log_fn)
             ml_oids = [seed_oid] + upstream_traced
             log_fn(f"Traced ML count (incl. seed): {len(ml_oids)}")
             log_fn(f"Traced ML OID preview: {_preview_oids(ml_oids)}")
