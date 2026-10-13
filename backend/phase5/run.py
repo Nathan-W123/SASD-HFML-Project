@@ -716,11 +716,36 @@ def find_mapped_pdfs(config):
     return found
 
 
-def _working_aprx_path(config, hfml_id):
+def resolve_project_path(config, log_fn=None):
+    """Return the .aprx to build maps from: arcgis_project_path from config.json
+    if it exists, otherwise the project currently open in ArcGIS Pro (only
+    available when called from inside Pro, i.e. from the toolbox)."""
+    configured = os.path.abspath(config["arcgis_project_path"])
+    if os.path.exists(configured):
+        return configured
+    current = None
+    try:
+        import arcpy
+        current = arcpy.mp.ArcGISProject("CURRENT").filePath
+    except Exception:
+        pass
+    if current and os.path.exists(current):
+        if log_fn:
+            log_fn(
+                f"  WARNING: arcgis_project_path in config.json not found ({configured}) — "
+                f"using the open ArcGIS Pro project instead: {current}"
+            )
+        return current
+    raise FileNotFoundError(
+        f"ArcGIS project not found: {configured}. Set arcgis_project_path in config.json "
+        "to the .aprx that has the map layouts, or run the tool from inside that project."
+    )
+
+
+def _working_aprx_path(aprx_src, hfml_id):
     # Scratch copy of the project, kept next to the original so its relative
     # data paths still resolve.  The finished map is saved to the run folder.
-    aprx_dir = os.path.dirname(os.path.abspath(config["arcgis_project_path"]))
-    return os.path.join(aprx_dir, f"_phase5_{hfml_id}_tmp.aprx")
+    return os.path.join(os.path.dirname(aprx_src), f"_phase5_{hfml_id}_tmp.aprx")
 
 
 def export_today():
@@ -738,8 +763,8 @@ def export_hfml_map(arcpy, hfml, config, today, observations_map, log_fn):
     pdf_path = hfml["pdf_path"]
     draft_aprx_path = hfml["draft_aprx_path"]
     os.makedirs(os.path.dirname(pdf_path), exist_ok=True)
-    aprx_src = os.path.abspath(config["arcgis_project_path"])
-    tmp_aprx = _working_aprx_path(config, hfml_id)
+    aprx_src = hfml.get("aprx_path") or resolve_project_path(config, log_fn)
+    tmp_aprx = _working_aprx_path(aprx_src, hfml_id)
     shutil.copy(aprx_src, tmp_aprx)
 
     try:
@@ -847,7 +872,7 @@ def export_hfml_map_out_of_process(hfml, config, log_fn):
 
     # The export process holds the scratch project open until it exits, so its
     # own cleanup can fail; remove it here now that the lock is released.
-    tmp_aprx = _working_aprx_path(config, hfml_id)
+    tmp_aprx = _working_aprx_path(hfml.get("aprx_path") or resolve_project_path(config), hfml_id)
     if os.path.exists(tmp_aprx):
         try:
             os.remove(tmp_aprx)
