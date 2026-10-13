@@ -657,7 +657,13 @@ def _append_seed_to_hfml_layer(arcpy, seed_oid, ml_source, hfml_layer, pmnum, pm
                     row[2] = frequency
                 cur.updateRow(row)
                 updated += 1
-    log_fn(f"  HFML seed appended for pmnum {pmnum}, frequency={frequency} ({updated} row(s))")
+    if freq_layer_field and frequency is not None:
+        freq_note = f"{freq_layer_field}={frequency}"
+    elif not freq_layer_field:
+        freq_note = "frequency NOT stamped — HFML layer has no 'frequency' field"
+    else:
+        freq_note = "frequency NOT stamped — no frequency found in PM_Mainlines"
+    log_fn(f"  HFML seed appended for pmnum {pmnum}, {freq_note} ({updated} row(s))")
 
 
 def run(log_fn):
