@@ -91,10 +91,14 @@ Each run writes to its own folder:
 1. Read the new HFMLs from PM_Mainlines (skipping any that already have a PDF)
 2. For each HFML, one at a time (Phase 4 and Phase 5 alternate per map):
    - Snapshot the max OBJECTID of each destination (HFML layer, ML, LL, parcels)
-   - Append the HFML seed to the HFML layer
-   - Recursively trace upstream and append the traced ML segments
+   - Append the HFML seed to the HFML layer (every GIS segment of its asset that joins
+     end to end, when the asset is split into several)
+   - Recursively trace upstream and append the traced ML segments. Pipes digitized
+     against the flow are followed when everything beyond them dead-ends (a gravity main
+     can't end in nothing); real flow splits are only reported in a `NOTE:` log line
    - Select and append LL features contacting those MLs
-   - Select and append parcels at the LLs' parcel-side endpoints
+   - Select and append parcels at the LLs' parcel-side endpoints (an endpoint that lies in
+     no parcel takes the nearest parcel within `PARCEL_SEARCH_FEET`)
    - Export the PDF map and save the map as a project into the run folder (Phase 5 export
      logic, below). The export runs in a
      standalone python.exe because `arcpy.mp` layout export fails inside the ArcGIS Pro process

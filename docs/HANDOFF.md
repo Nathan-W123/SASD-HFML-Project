@@ -46,6 +46,8 @@ Note: phases 3–5 require `arcpy`, so the pipeline can only be run end-to-end o
 ### Phase 4
 - Confirm `LL_SOURCE`, `LL_DEST`, `PARCELS_SOURCE`, `PARCELS_DEST` layer names in `backend/phase4/run.py`
 - LL contact uses `WITHIN_A_DISTANCE` plus endpoint filtering because LLs can have small gaps from MLs; tolerance is currently `1 Foot`
+- An LL end that lies in no parcel takes the nearest parcel within `PARCEL_SEARCH_FEET` (5 ft); the log reports how far those matches were, so the value can be tuned
+- `MAX_AGAINST_FLOW_RUN` (10) caps how many pipes digitized against the flow the trace follows from one manhole; longer runs are reported in a `NOTE:` log line instead. Fixing the direction in the GIS data (Flip Line) is the permanent fix for any pipe listed there
 
 ### Phase 5
 - Open the `.aprx` templates and confirm:
