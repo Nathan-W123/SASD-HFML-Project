@@ -16,6 +16,19 @@ FREQ_COL  = "frequency"
 TEMP_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "temp", "added_mls.json")
 
 
+def _norm(value):
+    # The same ID or frequency can read back as 3, 3.0 or "3" depending on how
+    # the cell was written, so compare values as text with any ".0" dropped.
+    if value is None:
+        return ""
+    text = str(value).strip()
+    try:
+        number = float(text)
+    except ValueError:
+        return text
+    return str(int(number)) if number.is_integer() else text
+
+
 def run(log_fn):
     config = load_config()
 
@@ -43,15 +56,20 @@ def run(log_fn):
         if col_name in import_headers:
             col_map[main_col_idx] = import_headers.index(col_name)
 
-    # Build lookup of existing MLs: id -> row index (normalize to str to handle int/str mismatch)
+    # Build lookup of existing MLs: id -> row index.  Rows without an ID (e.g.
+    # formatted-but-empty rows below the data) are not MLs, so skip them.
     existing = {}
     for i, row in enumerate(ws_main.iter_rows(min_row=2, values_only=True), start=2):
-        existing[str(row[main_id_idx])] = i
+        ml_id = _norm(row[main_id_idx])
+        if ml_id:
+            existing[ml_id] = i
 
     # Build lookup of import MLs: id -> full row
     incoming = {}
     for row in ws_import.iter_rows(min_row=2, values_only=True):
-        incoming[str(row[import_id_idx])] = row
+        ml_id = _norm(row[import_id_idx])
+        if ml_id:
+            incoming[ml_id] = row
 
     # Detect added MLs (in import, not in mainlines)
     added_ids = [ml_id for ml_id in incoming if ml_id not in existing]
@@ -83,7 +101,7 @@ def run(log_fn):
         if ml_id in incoming:
             new_freq = incoming[ml_id][import_freq_idx]
             current_freq = ws_main.cell(row=row_idx, column=main_freq_idx + 1).value
-            if str(new_freq) != str(current_freq):
+            if _norm(new_freq) != _norm(current_freq):
                 ws_main.cell(row=row_idx, column=main_freq_idx + 1).value = new_freq
                 freq_changes += 1
 

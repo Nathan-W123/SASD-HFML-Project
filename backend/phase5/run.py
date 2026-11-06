@@ -47,6 +47,14 @@ def _sql_literal(value):
     return str(value).replace("'", "''")
 
 
+def _display(value):
+    # Numeric fields read back as floats, which would print as "6.0 Month" or
+    # look up MXASSETNUM '500123.0'.
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
 def _pm_query(pmnum):
     return f"{HFML_ID_FIELD} = '{_sql_literal(pmnum)}'"
 
@@ -142,6 +150,7 @@ def _get_phase4_feature_info(arcpy, hfml, config, log_fn=None):
     pmnum = str(hfml["pmnum"])
     extents = []
     seed_target = None
+    seed_extent = None
 
     try:
         seed_extent, seed_target = _get_feature_info(arcpy, pmnum, config["p4_ml_layer_path"])
@@ -157,7 +166,7 @@ def _get_phase4_feature_info(arcpy, hfml, config, log_fn=None):
                 f"pmnum = '{_sql_literal(pmnum)}'"
             ) as cur:
                 for (a,) in cur:
-                    assetnum = str(a).strip() if a else None
+                    assetnum = _display(a).strip() if a else None
                     break
         except Exception:
             pass
@@ -171,6 +180,7 @@ def _get_phase4_feature_info(arcpy, hfml, config, log_fn=None):
                     for (geom,) in cur:
                         if geom:
                             extents.append(geom.extent)
+                            seed_extent = geom.extent
                             seed_target = geom.positionAlongLine(0.5, True).firstPoint
                         break
             except Exception:
@@ -207,7 +217,7 @@ def _get_phase4_feature_info(arcpy, hfml, config, log_fn=None):
                 (union.YMin + union.YMax) / 2,
             )
 
-    return union, seed_target
+    return union, seed_target, seed_extent
 
 
 def _select_template(extent, config):
@@ -406,7 +416,7 @@ def _box_edge_toward(bx1, by1, bx2, by2, tx, ty):
     return (best[1], best[2]) if best else (cx, by1)
 
 
-def _best_callout_position(map_frame, feature_extent, target_x, target_y, box_w, box_h):
+def _best_callout_position(map_frame, feature_extent, target_x, target_y, box_w, box_h, hfml_extent=None):
     fx = map_frame.elementPositionX
     fy = map_frame.elementPositionY
     fw = map_frame.elementWidth
@@ -415,6 +425,7 @@ def _best_callout_position(map_frame, feature_extent, target_x, target_y, box_w,
 
     page_feat = _map_extent_to_page(map_frame, feature_extent)
     fpx1, fpy1, fpx2, fpy2 = page_feat if page_feat else (0, 0, 0, 0)
+    page_hfml = _map_extent_to_page(map_frame, hfml_extent) if hfml_extent is not None else None
 
     x_min = fx + edge
     x_max = fx + fw - edge - box_w
@@ -454,10 +465,14 @@ def _best_callout_position(map_frame, feature_extent, target_x, target_y, box_w,
     best = None
     for bx, by in candidates:
         overlaps = _rects_overlap(bx, by, bx + box_w, by + box_h, fpx1, fpy1, fpx2, fpy2)
-        # Score: prefer no overlap, then minimize distance to target (shortest arrow)
+        # When every candidate overlaps the content (the 30% padding usually
+        # leaves margins narrower than the box), the nearest one can sit on the
+        # HFML itself, so rule out covering the HFML first.
+        covers_hfml = page_hfml is not None and _rects_overlap(bx, by, bx + box_w, by + box_h, *page_hfml)
+        # Score: avoid the HFML, prefer no overlap, then minimize distance to target (shortest arrow)
         cx, cy = bx + box_w / 2, by + box_h / 2
         target_dist = ((cx - target_x) ** 2 + (cy - target_y) ** 2) ** 0.5
-        score = (int(overlaps), target_dist)
+        score = (int(covers_hfml), int(overlaps), target_dist)
         if best is None or score < best[0]:
             best = (score, bx, by)
 
@@ -475,7 +490,7 @@ def _lookup_gridno(arcpy, config, hfml_id):
             f"pmnum = '{_sql_literal(hfml_id)}'"
         ) as cur:
             for (val,) in cur:
-                return str(val) if val else hfml_id
+                return _display(val) if val else hfml_id
     except Exception:
         pass
     return hfml_id
@@ -514,10 +529,10 @@ def _get_callout_text(arcpy, config, hfml_id, observations="", log_fn=None, grid
         ) as cursor:
             for row in cursor:
                 rd = {k.lower(): v for k, v in zip(pm_fields, row)}
-                frequency = str(rd.get("frequency") or "")
+                frequency = _display(rd.get("frequency") or "")
                 last_date = rd.get("laststartdate") or ""
-                assetnum  = str(rd.get("assetnum") or "")
-                gridno    = str(rd.get("gridno") or gridno)
+                assetnum  = _display(rd.get("assetnum") or "")
+                gridno    = _display(rd.get("gridno") or gridno)
                 break
     except Exception as exc:
         if log_fn:
@@ -542,11 +557,11 @@ def _get_callout_text(arcpy, config, hfml_id, observations="", log_fn=None, grid
                 for row in cursor:
                     rd = {k.lower(): v for k, v in zip(ml_fields, row)}
                     if diam_key:
-                        diameter = str(rd.get(diam_key) or "")
+                        diameter = _display(rd.get(diam_key) or "")
                     if matl_key:
                         mat_type = str(rd.get(matl_key) or "")
                     if grid_key:
-                        grid_no  = str(rd.get(grid_key) or gridno)
+                        grid_no  = _display(rd.get(grid_key) or gridno)
                     break
         except Exception as exc:
             if log_fn:
@@ -577,9 +592,7 @@ def _get_callout_text(arcpy, config, hfml_id, observations="", log_fn=None, grid
     return text
 
 
-def _try_add_callout(layout, map_frame, feature_extent, target_point, text, log_fn):
-    import math
-
+def _try_add_callout(layout, map_frame, feature_extent, target_point, text, log_fn, hfml_extent=None):
     page_xy = _page_xy_from_map_point(map_frame, target_point)
     if page_xy is None:
         log_fn("Callout skipped: could not convert HFML map point to page coordinates")
@@ -602,7 +615,9 @@ def _try_add_callout(layout, map_frame, feature_extent, target_point, text, log_
         # 0.07in/char + 0.3in padding avoids wrapping; 0.14in/line + 0.35in margin avoids cutoff
         box_w = max(1.2, max_chars * 0.07 + 0.3)
         box_h = max(0.7, len(lines) * 0.14 + 0.35)
-        box_x1, box_y1 = _best_callout_position(map_frame, feature_extent, target_x, target_y, box_w, box_h)
+        box_x1, box_y1 = _best_callout_position(
+            map_frame, feature_extent, target_x, target_y, box_w, box_h, hfml_extent,
+        )
         box_x2, box_y2 = box_x1 + box_w, box_y1 + box_h
         # Arrow touches the textbox edge (not center, not beyond)
         arrow_tx, arrow_ty = _box_edge_toward(box_x1, box_y1, box_x2, box_y2, target_x, target_y)
@@ -657,24 +672,32 @@ def _parse_observations(memo):
     memo_lower = memo.lower()
     findings = []
     for debris in _DEBRIS_TYPES:
-        if debris not in memo_lower:
+        pos = memo_lower.find(debris)
+        if pos < 0:
             continue
-        pos = memo_lower.index(debris)
+        end = pos + len(debris)
         # Search 60 chars before AND after the debris word so both
         # "heavy grease" and "grease (heavy)" / "roots — moderate" are caught.
-        window = memo_lower[max(0, pos - 60): pos + len(debris) + 60]
-        matched_severity = None
+        # The window can hold another debris type's severity too ("heavy grease,
+        # moderate roots"), so the severity word nearest this debris word wins.
+        window_start = max(0, pos - 60)
+        window = memo_lower[window_start:end + 60]
+        nearest = None
         for sev in _SEVERITIES:
-            if re.search(rf"\b{sev}\b", window):
-                matched_severity = sev
-        if matched_severity:
-            findings.append(f"{matched_severity.capitalize()} {debris}")
+            for match in re.finditer(rf"\b{sev}\b", window):
+                sev_start = window_start + match.start()
+                sev_end = window_start + match.end()
+                distance = pos - sev_end if sev_end <= pos else sev_start - end
+                if nearest is None or distance < nearest[0]:
+                    nearest = (distance, sev)
+        if nearest:
+            findings.append(f"{nearest[1].capitalize()} {debris}")
         else:
             findings.append(debris.capitalize())
     return ", ".join(findings)
 
 
-def fetch_observations(pmnum_list, config):
+def fetch_observations(pmnum_list, config, log_fn=None):
     if not pmnum_list:
         return {}
     conn_str = (
@@ -687,7 +710,6 @@ def fetch_observations(pmnum_list, config):
     # Try dbo schema prefix first; fall back to bare table name if the login's
     # default schema differs.  Both failures are logged so silent blank callouts
     # can be diagnosed.
-    observations = {}
     for table_ref in ("dbo.pmmemo", "pmmemo"):
         query = f"""
             SELECT pmnum, pmmemo
@@ -699,19 +721,21 @@ def fetch_observations(pmnum_list, config):
             ) t
             WHERE rn = 1
         """
+        conn = None
         try:
             conn = pyodbc.connect(conn_str)
             cur = conn.cursor()
             cur.execute(query, pmnum_list)
-            for row in cur.fetchall():
-                pmnum = str(row[0]).strip()
-                observations[pmnum] = _parse_observations(row[1])
-            conn.close()
-            break  # succeeded — don't try the fallback
+            # Succeeded — don't try the fallback.
+            return {str(row[0]).strip(): _parse_observations(row[1]) for row in cur.fetchall()}
         except Exception as exc:
-            if table_ref == "pmmemo":
-                pass  # both attempts failed; callout renders without observations
-    return observations
+            if log_fn:
+                log_fn(f"  WARNING: could not read observations from {table_ref} — {exc}")
+        finally:
+            if conn is not None:
+                conn.close()
+    # Both attempts failed; the callout renders without observations.
+    return {}
 
 
 def _load_phase4_manifest():
@@ -803,7 +827,7 @@ def export_hfml_map(arcpy, hfml, config, today, observations_map, log_fn):
     """Export the PDF map for one HFML.  Called by Phase 4 right after the
     HFML's features are appended, before they are cleaned back out."""
     hfml_id = str(hfml["pmnum"])
-    extent, target_point = _get_phase4_feature_info(arcpy, hfml, config, log_fn)
+    extent, target_point, hfml_extent = _get_phase4_feature_info(arcpy, hfml, config, log_fn)
     layout_name, orientation = _select_template(extent, config)
     log_fn(f"Selected {orientation} layout for HFML {hfml_id}")
 
@@ -846,6 +870,7 @@ def export_hfml_map(arcpy, hfml, config, today, observations_map, log_fn):
             target_point,
             _get_callout_text(arcpy, config, hfml_id, observations_map.get(hfml_id, ""), log_fn, gridno=gridno),
             log_fn,
+            hfml_extent=hfml_extent,
         )
 
         if os.path.exists(pdf_path):
@@ -941,7 +966,7 @@ def _run_export_job():
         arcpy = _import_arcpy()
         config = load_config()
         hfml_id = str(hfml["pmnum"])
-        observations_map = fetch_observations([hfml_id], config)
+        observations_map = fetch_observations([hfml_id], config, log_fn)
         export_hfml_map(arcpy, hfml, config, export_today(), observations_map, log_fn)
     except Exception:
         log_fn(traceback.format_exc())

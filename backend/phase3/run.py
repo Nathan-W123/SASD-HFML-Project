@@ -62,6 +62,9 @@ def run(log_fn):
 
     log_fn("Converting Excel to GIS table...")
     scratch_table = "in_memory\\excel_import"
+    # A failed earlier run in this Pro session can leave the scratch table behind.
+    if arcpy.Exists(scratch_table):
+        arcpy.management.Delete(scratch_table)
     arcpy.conversion.ExcelToTable(
         config["excel_workbook_path"],
         scratch_table,
@@ -74,7 +77,10 @@ def run(log_fn):
     for src_field, dst_field in FIELD_MAPPINGS:
         fm = arcpy.FieldMap()
         fm.addInputField(scratch_table, src_field)
-        fm.outputField.name = dst_field
+        # outputField returns a copy, so the renamed field must be assigned back.
+        out_field = fm.outputField
+        out_field.name = dst_field
+        fm.outputField = out_field
         field_map.addFieldMap(fm)
 
     arcpy.management.Append(
