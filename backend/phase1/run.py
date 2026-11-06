@@ -2,8 +2,6 @@ import os
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-import csv
-import tempfile
 import pyodbc
 import pandas as pd
 import openpyxl
@@ -36,23 +34,19 @@ def run(log_fn):
         if converted.notna().all():
             df[col] = converted
 
-    tmp = tempfile.NamedTemporaryFile(suffix=".csv", delete=False)
-    tmp_path = tmp.name
-    tmp.close()
-    df.to_csv(tmp_path, index=False)
-
     log_fn("Writing to Excel import sheet...")
     wb = openpyxl.load_workbook(config["excel_workbook_path"])
 
     if "import" in wb.sheetnames:
         del wb["import"]
 
+    # Write the DataFrame's values directly: a CSV round trip turns every number
+    # and date (including the conversions above) back into text.
     ws = wb.create_sheet("import")
-    with open(tmp_path, "r") as f:
-        for row in csv.reader(f):
-            ws.append(row)
+    ws.append(list(df.columns))
+    for row in df.astype(object).itertuples(index=False):
+        ws.append([None if pd.isna(value) else value for value in row])
 
     wb.save(config["excel_workbook_path"])
-    os.unlink(tmp_path)
 
     log_fn(f"Phase 1 complete — {len(df)} rows imported")

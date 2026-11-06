@@ -17,7 +17,7 @@ requirements.txt — pip dependencies
 - `SASD_HFML.pyt` — single "Run HFML Pipeline" geoprocessing tool: runs phases 1–5 in order inside ArcGIS Pro, logs to the Geoprocessing pane, halts on the first failure. Reloads backend modules on each run so code edits apply without restarting Pro.
 
 **Backend — all phases wired into the toolbox via `run(log_fn)` signature**
-- `backend/phase1/run.py` — full skeleton: SQL query → CSV → Excel `import` sheet
+- `backend/phase1/run.py` — full skeleton: SQL query → DataFrame → Excel `import` sheet (values written typed, not via CSV)
 - `backend/phase2/run.py` — full skeleton: detect added MLs + frequency changes, append to mainlines, delete import sheet, write `temp/added_mls.json`
 - `backend/phase3/run.py` — skeleton: arcpy ExcelToTable + Append upsert with field mapping
 - `backend/phase4/run.py` — skeleton: loop over added HFMLs, recursive upstream ML trace, append MLs → select contacting LLs → append LLs → select intersecting parcels → append parcels

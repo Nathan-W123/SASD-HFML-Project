@@ -578,8 +578,6 @@ def _get_callout_text(arcpy, config, hfml_id, observations="", log_fn=None, grid
 
 
 def _try_add_callout(layout, map_frame, feature_extent, target_point, text, log_fn):
-    import math
-
     page_xy = _page_xy_from_map_point(map_frame, target_point)
     if page_xy is None:
         log_fn("Callout skipped: could not convert HFML map point to page coordinates")
@@ -657,24 +655,32 @@ def _parse_observations(memo):
     memo_lower = memo.lower()
     findings = []
     for debris in _DEBRIS_TYPES:
-        if debris not in memo_lower:
+        pos = memo_lower.find(debris)
+        if pos < 0:
             continue
-        pos = memo_lower.index(debris)
+        end = pos + len(debris)
         # Search 60 chars before AND after the debris word so both
         # "heavy grease" and "grease (heavy)" / "roots — moderate" are caught.
-        window = memo_lower[max(0, pos - 60): pos + len(debris) + 60]
-        matched_severity = None
+        # The window can hold another debris type's severity too ("heavy grease,
+        # moderate roots"), so the severity word nearest this debris word wins.
+        window_start = max(0, pos - 60)
+        window = memo_lower[window_start:end + 60]
+        nearest = None
         for sev in _SEVERITIES:
-            if re.search(rf"\b{sev}\b", window):
-                matched_severity = sev
-        if matched_severity:
-            findings.append(f"{matched_severity.capitalize()} {debris}")
+            for match in re.finditer(rf"\b{sev}\b", window):
+                sev_start = window_start + match.start()
+                sev_end = window_start + match.end()
+                distance = pos - sev_end if sev_end <= pos else sev_start - end
+                if nearest is None or distance < nearest[0]:
+                    nearest = (distance, sev)
+        if nearest:
+            findings.append(f"{nearest[1].capitalize()} {debris}")
         else:
             findings.append(debris.capitalize())
     return ", ".join(findings)
 
 
-def fetch_observations(pmnum_list, config):
+def fetch_observations(pmnum_list, config, log_fn=None):
     if not pmnum_list:
         return {}
     conn_str = (
@@ -687,7 +693,6 @@ def fetch_observations(pmnum_list, config):
     # Try dbo schema prefix first; fall back to bare table name if the login's
     # default schema differs.  Both failures are logged so silent blank callouts
     # can be diagnosed.
-    observations = {}
     for table_ref in ("dbo.pmmemo", "pmmemo"):
         query = f"""
             SELECT pmnum, pmmemo
@@ -699,19 +704,21 @@ def fetch_observations(pmnum_list, config):
             ) t
             WHERE rn = 1
         """
+        conn = None
         try:
             conn = pyodbc.connect(conn_str)
             cur = conn.cursor()
             cur.execute(query, pmnum_list)
-            for row in cur.fetchall():
-                pmnum = str(row[0]).strip()
-                observations[pmnum] = _parse_observations(row[1])
-            conn.close()
-            break  # succeeded — don't try the fallback
+            # Succeeded — don't try the fallback.
+            return {str(row[0]).strip(): _parse_observations(row[1]) for row in cur.fetchall()}
         except Exception as exc:
-            if table_ref == "pmmemo":
-                pass  # both attempts failed; callout renders without observations
-    return observations
+            if log_fn:
+                log_fn(f"  WARNING: could not read observations from {table_ref} — {exc}")
+        finally:
+            if conn is not None:
+                conn.close()
+    # Both attempts failed; the callout renders without observations.
+    return {}
 
 
 def _load_phase4_manifest():
@@ -941,7 +948,7 @@ def _run_export_job():
         arcpy = _import_arcpy()
         config = load_config()
         hfml_id = str(hfml["pmnum"])
-        observations_map = fetch_observations([hfml_id], config)
+        observations_map = fetch_observations([hfml_id], config, log_fn)
         export_hfml_map(arcpy, hfml, config, export_today(), observations_map, log_fn)
     except Exception:
         log_fn(traceback.format_exc())

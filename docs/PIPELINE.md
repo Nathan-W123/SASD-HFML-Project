@@ -6,14 +6,14 @@
 2. Open connection to SQL database using `pyodbc`
 3. Execute the predefined SQL query
 4. Fetch all results into a `pandas` DataFrame
-5. Export DataFrame to a temporary CSV file in a local temp directory
+5. Convert text columns whose values are all numeric (e.g. IDs) to numbers
 6. Open the shared Excel workbook using `openpyxl`
 7. Check if a sheet named `import` already exists — if so, delete it
 8. Create a new sheet named `import`
-9. Write CSV data into the `import` sheet row by row, preserving headers
+9. Write the DataFrame into the `import` sheet row by row, headers first, keeping numbers and dates typed
+   (no CSV round trip, which would turn every value into text); NULLs become empty cells
 10. Save and close the workbook
-11. Delete the temporary CSV file
-12. Log: "Phase 1 complete — X rows imported"
+11. Log: "Phase 1 complete — X rows imported"
 
 ---
 

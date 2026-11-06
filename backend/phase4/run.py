@@ -75,6 +75,17 @@ def _get_field_names(arcpy, dataset):
     )
 
 
+def _norm_id(value):
+    # PM_Mainlines, the HFML layer and the ML source don't necessarily store IDs
+    # with the same field type, so 500123, 500123.0 and "500123 " must match.
+    text = str(value).strip()
+    try:
+        number = float(text)
+    except ValueError:
+        return text
+    return str(int(number)) if number.is_integer() else text
+
+
 def _geom_to_temp_fc(arcpy, geom, name):
     path = f"in_memory\\{name}"
     if arcpy.Exists(path):
@@ -318,12 +329,22 @@ def _delete_rows_after(arcpy, path, max_oid):
 def _cleanup_destinations(arcpy, snapshot, log_fn):
     """Remove every row appended since the snapshot so the destinations look
     as if this HFML was never traced.  The exported PDF is the only output."""
+    leftovers = []
     for path, max_oid in snapshot.items():
         try:
             deleted = _delete_rows_after(arcpy, path, max_oid)
             log_fn(f"  Cleaned up {deleted} row(s) from {path}")
         except Exception as exc:
-            log_fn(f"  WARNING: cleanup failed for {path} — {exc}")
+            log_fn(f"  ERROR: cleanup failed for {path} — {exc}")
+            leftovers.append(f"{path} (OBJECTID > {max_oid})")
+    if leftovers:
+        # Stop rather than carry on: leftover rows would be drawn on later maps,
+        # and a leftover HFML seed makes its pmnum count as already mapped.
+        raise RuntimeError(
+            "Could not remove the rows appended for this HFML from: "
+            + "; ".join(leftovers)
+            + ". Delete those rows by hand, then rerun Phase 4."
+        )
 
 
 def _write_phase4_map_manifest(hfml_records, log_fn):
@@ -719,23 +740,23 @@ def run(log_fn):
     with arcpy.da.SearchCursor(pm_mainlines_path, [config["unique_id_field"], "assetnum"]) as cursor:
         for row in cursor:
             if row[1] is not None:
-                all_assetnums[str(row[0])] = str(row[1])
+                all_assetnums[str(row[0])] = _norm_id(row[1])
 
     log_fn(f"Found {len(all_assetnums)} total HFMLs in PM_Mainlines")
 
     # Determine which pmnums are already done.  Each HFML's features are deleted
     # after its map is exported, so an existing PDF is what marks it as mapped.
     # Seeds left in PMs_SSGRAVITYMAIN by earlier runs also count.
-    mapped_pdfs = find_mapped_pdfs(config)
-    already_done = {p for p in all_assetnums if p in mapped_pdfs}
+    done_ids = {_norm_id(p) for p in find_mapped_pdfs(config)}
     try:
         with arcpy.da.SearchCursor(hfml_layer, ["PM_Mainlines_pmnum"]) as cursor:
             for (pmnum,) in cursor:
                 if pmnum is not None:
-                    already_done.add(str(pmnum))
+                    done_ids.add(_norm_id(pmnum))
     except Exception as exc:
         log_fn(f"  WARNING: could not read existing seeds from HFML layer — {exc}")
 
+    already_done = {p for p in all_assetnums if _norm_id(p) in done_ids}
     new_assetnums = {p: a for p, a in all_assetnums.items() if p not in already_done}
     log_fn(f"Already processed: {len(already_done)}, New to process: {len(new_assetnums)}")
 
@@ -749,7 +770,7 @@ def run(log_fn):
     assetnum_set = set(new_assetnums.values())
     with arcpy.da.SearchCursor(ml_source, ["MXASSETNUM", "SHAPE@"]) as cursor:
         for row in cursor:
-            assetnum = str(row[0])
+            assetnum = _norm_id(row[0])
             if assetnum not in assetnum_set or row[1] is None:
                 continue
             seg_len = row[1].length
