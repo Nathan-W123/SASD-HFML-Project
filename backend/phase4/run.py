@@ -766,9 +766,10 @@ def run(log_fn):
         return
 
     assetnum_to_geom = {}
+    assetnum_to_oid  = {}
     assetnum_to_len  = {}
     assetnum_set = set(new_assetnums.values())
-    with arcpy.da.SearchCursor(ml_source, ["MXASSETNUM", "SHAPE@"]) as cursor:
+    with arcpy.da.SearchCursor(ml_source, ["MXASSETNUM", "SHAPE@", "OID@"]) as cursor:
         for row in cursor:
             assetnum = _norm_id(row[0])
             if assetnum not in assetnum_set or row[1] is None:
@@ -776,10 +777,12 @@ def run(log_fn):
             seg_len = row[1].length
             if assetnum not in assetnum_to_geom:
                 assetnum_to_geom[assetnum] = row[1]
+                assetnum_to_oid[assetnum]  = row[2]
                 assetnum_to_len[assetnum]  = seg_len
             elif seg_len > assetnum_to_len[assetnum]:
                 log_fn(f"  WARNING: duplicate MXASSETNUM {assetnum} — keeping longer segment ({seg_len:.1f} > {assetnum_to_len[assetnum]:.1f})")
                 assetnum_to_geom[assetnum] = row[1]
+                assetnum_to_oid[assetnum]  = row[2]
                 assetnum_to_len[assetnum]  = seg_len
             else:
                 log_fn(f"  WARNING: duplicate MXASSETNUM {assetnum} — discarding shorter segment ({seg_len:.1f})")
@@ -789,7 +792,7 @@ def run(log_fn):
     new_hfmls = []
     for pmnum, assetnum in new_assetnums.items():
         if assetnum in assetnum_to_geom:
-            new_hfmls.append({"pmnum": pmnum, "geom": assetnum_to_geom[assetnum]})
+            new_hfmls.append({"pmnum": pmnum, "geom": assetnum_to_geom[assetnum], "oid": assetnum_to_oid[assetnum]})
         else:
             log_fn(f"  pmnum {pmnum} assetnum {assetnum} has no geometry in ML source — skipping")
 
@@ -818,23 +821,16 @@ def run(log_fn):
 
         directed_net, geoms, pipe_ups = _build_directed_network(arcpy, ml_source, start_geom, log_fn)
 
-        # Find the seed HFML's own OID in the network by coordinate match
-        seed_x1 = round(start_geom.firstPoint.X, 3)
-        seed_y1 = round(start_geom.firstPoint.Y, 3)
-        seed_x2 = round(start_geom.lastPoint.X,  3)
-        seed_y2 = round(start_geom.lastPoint.Y,  3)
-        seed_oid = next(
-            (oid for oid, (x1, y1, x2, y2) in geoms.items()
-             if (x1 == seed_x1 and y1 == seed_y1 and x2 == seed_x2 and y2 == seed_y2)
-             or (x1 == seed_x2 and y1 == seed_y2 and x2 == seed_x1 and y2 == seed_y1)),
-            None
-        )
+        # Use the HFML's own OID.  Matching it by endpoint coordinates could pick
+        # another pipe between the same two manholes — and one digitized the
+        # other way round would send the trace up from the downstream manhole.
+        seed_oid = hfml["oid"] if hfml["oid"] in geoms else None
         log_fn(f"Seed HFML OID in network: {seed_oid}")
 
         if seed_oid is None:
             log_fn(
-                f"  ERROR: seed OID not found in network for pmnum {pmnum} — "
-                "coordinate precision mismatch or feature not in spatially filtered area. "
+                f"  ERROR: seed OID {hfml['oid']} not found in network for pmnum {pmnum} — "
+                "feature not in spatially filtered area. "
                 "Skipping HFML (will not appear in manifest)."
             )
             continue
