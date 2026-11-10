@@ -401,17 +401,19 @@ def _log_layer_report(arcpy, map_obj, hfml_id, config, log_fn, hfml=None):
             renderer = f", symbology={r.type}" + (f" on {fields}" if fields else "")
         except Exception:
             pass
-        expected = appended.get(role)
+        # NB: not "expected" -- that name holds the path->role map this loop reads.
+        expected_count = appended.get(role)
         note = ""
-        if expected is not None and isinstance(count, int) and count != expected:
-            if count < expected:
+        if expected_count is not None and isinstance(count, int) and count != expected_count:
+            if count < expected_count:
                 note = (
-                    f" — WARNING: {expected - count} of the {expected} appended this run are not drawn"
+                    f" — WARNING: {expected_count - count} of the {expected_count} appended this run "
+                    "are not drawn"
                 )
             else:
                 note = (
-                    f" — WARNING: {count - expected} more than the {expected} appended this run, so "
-                    "rows left behind by an earlier run are being drawn on this map"
+                    f" — WARNING: {count - expected_count} more than the {expected_count} appended "
+                    "this run, so rows left behind by an earlier run are being drawn on this map"
                 )
         log_fn(
             f"  Layer '{layer.name}' [{role or 'NOT a Phase 4 output'}] draws {count} feature(s)"

@@ -215,7 +215,10 @@ class _NodeSnapper:
                     ):
                         best, best_distance = rep, distance
         if best is not None:
-            if best_distance > 0:
+            # Representatives are stored rounded to 3 decimals, so an end that
+            # was already coincident still measures a fraction of a thousandth
+            # away.  Only count a real merge.
+            if best_distance > 0.001:
                 self.snapped += 1
             return best
         rep = (round(x, 3), round(y, 3))
