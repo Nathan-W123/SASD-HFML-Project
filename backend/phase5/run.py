@@ -965,6 +965,15 @@ def _run_export_job():
             hfml = json.load(f)
         arcpy = _import_arcpy()
         config = load_config()
+        # Phase 4 may have read a local copy of a source instead of the path in
+        # config.json.  The object IDs in this job belong to that copy, so use
+        # the same paths here or the map would be drawn from whatever features
+        # happen to carry those IDs in the remote source.
+        overrides = hfml.get("source_overrides") or {}
+        for key, value in overrides.items():
+            if config.get(key) != value:
+                log_fn(f"Using Phase 4 source override: {key} -> {value}")
+            config[key] = value
         hfml_id = str(hfml["pmnum"])
         observations_map = fetch_observations([hfml_id], config, log_fn)
         export_hfml_map(arcpy, hfml, config, export_today(), observations_map, log_fn)

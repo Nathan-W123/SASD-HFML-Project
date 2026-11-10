@@ -6,6 +6,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 
 import json
 
+from backend.phase4.network_cache import (
+    Phase4Cache, dataset_signature, default_cache_dir, signature_is_weak,
+)
 from config_loader import load_config
 
 BUFFER_DISTANCE = "50000 Feet"
@@ -20,6 +23,9 @@ PARCEL_SEARCH_FEET = 5.0
 # traced manhole; a longer run is treated as a real flow split (reported only).
 MAX_AGAINST_FLOW_RUN = 10
 ARCPY_RETRY_ATTEMPTS = 3
+# Beyond this a WHERE clause risks hitting backend query-length limits, so
+# the ML source is read in full and filtered in Python instead.
+MAX_WHERE_CLAUSE_CHARS = 30000
 # Beta testing: only map this many new HFMLs per run.  Raise (or remove) once
 # the full monthly batch should be processed.
 MAX_HFMLS_PER_RUN = 5
@@ -165,7 +171,11 @@ def _preflight_phase4(arcpy, config, log_fn):
 
 
 def _build_directed_network(arcpy, ml_source, start_geom, log_fn):
-    """Build a directed upstream network from the spatially filtered ML source.
+    """Build a directed upstream network from the ML source.
+
+    start_geom limits the network to pipes within BUFFER_DISTANCE of that
+    geometry.  Pass None to build over the whole source, which is what the
+    cached once-per-run build does.
 
     Direction is determined by (in priority order):
       1. UPNODE / DNNODE node-ID fields if present — explicit and reliable.
@@ -179,15 +189,22 @@ def _build_directed_network(arcpy, ml_source, start_geom, log_fn):
       pipe_dns      — dict: oid → downstream_key
       use_nodes     — True when keys are node IDs rather than (x, y) coordinates
     """
-    log_fn(f"Spatially filtering network within {BUFFER_DISTANCE} of target HFML...")
-    seed_fc = _geom_to_temp_fc(arcpy, start_geom, "_SeedGeomNet")
-    _replace_temp_layer(arcpy, "_NetworkSource", ml_source)
-    arcpy.management.SelectLayerByLocation(
-        "_NetworkSource", "WITHIN_A_DISTANCE", seed_fc,
-        search_distance=BUFFER_DISTANCE,
-        selection_type="NEW_SELECTION"
-    )
-    arcpy.management.Delete(seed_fc)
+    if start_geom is None:
+        # Whole-extent build, used once per run and then cached.  Nothing is
+        # cut off at the buffer edge, so a trace with a long upstream run is
+        # followed to its real end rather than to 50,000 feet.
+        log_fn("Building the directed network over the full extent of the ML source...")
+        _replace_temp_layer(arcpy, "_NetworkSource", ml_source)
+    else:
+        log_fn(f"Spatially filtering network within {BUFFER_DISTANCE} of target HFML...")
+        seed_fc = _geom_to_temp_fc(arcpy, start_geom, "_SeedGeomNet")
+        _replace_temp_layer(arcpy, "_NetworkSource", ml_source)
+        arcpy.management.SelectLayerByLocation(
+            "_NetworkSource", "WITHIN_A_DISTANCE", seed_fc,
+            search_distance=BUFFER_DISTANCE,
+            selection_type="NEW_SELECTION"
+        )
+        arcpy.management.Delete(seed_fc)
 
     # Detect node-ID fields for explicit direction (case-insensitive search)
     _up_aliases = {"upnode", "us_node", "usnode", "fromnode", "node_f"}
@@ -886,6 +903,147 @@ def _asset_chain(segments):
     return best, [seg for g in groups if g is not best for seg in g] + copies
 
 
+def _assetnum_where_clause(arcpy, ml_source, assetnums):
+    """A WHERE clause selecting only these assetnums, or None to read every row.
+
+    PM_Mainlines, the HFML layer and the ML source do not agree on field type,
+    so one assetnum can be stored as 500123, 500123.0 or "500123 " (this is what
+    _norm_id exists for).  For a text field both plain and ".0" spellings are
+    listed; for a numeric field the numeric form is used.  Anything that cannot
+    be expressed safely returns None, and the caller then reads every row as it
+    did before -- a slower scan is always better than a silently missed HFML.
+    """
+    if not assetnums:
+        return None
+    try:
+        field = next(
+            (f for f in arcpy.ListFields(ml_source) if f.name.lower() == "mxassetnum"),
+            None,
+        )
+        if field is None:
+            return None
+        delimited = arcpy.AddFieldDelimiters(ml_source, field.name)
+        if field.type in ("String", "Guid"):
+            spellings = set()
+            for assetnum in assetnums:
+                spellings.add(str(assetnum))
+                spellings.add(f"{assetnum}.0")
+            literals = ", ".join(
+                "'" + value.replace("'", "''") + "'" for value in sorted(spellings)
+            )
+        else:
+            numbers = set()
+            for assetnum in assetnums:
+                try:
+                    numbers.add(str(int(float(assetnum))))
+                except (TypeError, ValueError):
+                    # Not expressible as a number against a numeric field.
+                    return None
+            literals = ", ".join(sorted(numbers))
+        if not literals:
+            return None
+        clause = f"{delimited} IN ({literals})"
+        if len(clause) > MAX_WHERE_CLAUSE_CHARS:
+            return None
+        return clause
+    except Exception:
+        return None
+
+
+def _read_assetnum_segments(arcpy, ml_source, assetnum_set, config, log_fn):
+    """Map each wanted assetnum to its (oid, geometry) segments in the ML source.
+
+    Asks the source for just those assetnums when it can.  If that returns
+    nothing at all while assetnums were wanted, the clause is assumed wrong for
+    how this source stores them and every row is read instead.
+    """
+    def _scan(where):
+        found = {}
+        with arcpy.da.SearchCursor(
+            ml_source, ["MXASSETNUM", "SHAPE@", "OID@"], where
+        ) as cursor:
+            for row in cursor:
+                assetnum = _norm_id(row[0])
+                if assetnum in assetnum_set and row[1] is not None:
+                    found.setdefault(assetnum, []).append((row[2], row[1]))
+        return found
+
+    where = None
+    if config.get("p4_filter_assetnum_scan", True):
+        where = _assetnum_where_clause(arcpy, ml_source, assetnum_set)
+        if where is None:
+            log_fn("  Reading the whole ML source (no safe assetnum filter available)")
+        else:
+            log_fn(f"  Asking the ML source for {len(assetnum_set)} assetnum(s) only")
+
+    segments = _scan(where)
+    if where is not None and not segments and assetnum_set:
+        log_fn(
+            "  WARNING: the assetnum filter matched nothing — falling back to a "
+            "full scan of the ML source"
+        )
+        segments = _scan(None)
+    return segments
+
+
+def _setup_phase4_cache(arcpy, config, ml_source, log_fn):
+    """Prepare the local cache.
+
+    Returns (ml_source_to_use, directed_network_or_None).  The network is None
+    when caching is off or unusable, and Phase 4 then builds a spatially
+    filtered network per HFML exactly as it used to.
+
+    Note the returned path may be a LOCAL COPY of the ML source, whose
+    OBJECTIDs differ from the remote original.  Every later step that takes ML
+    object IDs -- tracing, appending, and the map export subprocess -- must use
+    the returned path.
+    """
+    if not config.get("p4_cache_enabled", True):
+        log_fn("Phase 4 cache disabled in config.json — building the network per HFML")
+        return ml_source, None
+
+    cache_dir = config.get("p4_cache_dir") or ""
+    if cache_dir and not os.path.isabs(cache_dir):
+        log_fn(
+            f"  WARNING: p4_cache_dir must be an absolute local path — ignoring {cache_dir!r}"
+        )
+        cache_dir = ""
+    cache = Phase4Cache(
+        cache_dir or default_cache_dir(),
+        config.get("p4_cache_max_age_days", 7),
+        log_fn,
+    )
+    log_fn(f"Phase 4 cache folder: {cache.dir}")
+
+    signature = dataset_signature(arcpy, ml_source)
+    log_fn(f"  ML source fingerprint: {signature}")
+    if signature_is_weak(signature):
+        log_fn(
+            "  NOTE: only a feature count is available for this source, so an edit "
+            "that leaves the count unchanged would go unnoticed; the cache age "
+            "limit is the backstop."
+        )
+
+    effective = ml_source
+    if config.get("p4_cache_local_ml_copy", True):
+        local = cache.local_ml_copy(arcpy, ml_source, signature)
+        if local:
+            effective = local
+
+    network = cache.load_network(effective, signature)
+    if network is None:
+        started = time.time()
+        try:
+            network = _build_directed_network(arcpy, effective, None, log_fn)
+        except Exception as exc:
+            log_fn(f"  WARNING: whole-extent network build failed — {exc}")
+            log_fn("  Falling back to the per-HFML filtered build.")
+            return effective, None
+        log_fn(f"  Built the directed network in {time.time() - started:.1f}s")
+        cache.save_network(effective, signature, network)
+    return effective, network
+
+
 def run(log_fn):
     # Imported here: phase5 imports PHASE4_MAP_OUTPUT_PATH from this module.
     from backend.phase5.run import (
@@ -947,13 +1105,19 @@ def run(log_fn):
         _write_phase4_map_manifest([], log_fn)
         return
 
-    assetnum_segments = {}
+    # Local copy of the ML source plus the directed network, both reused until
+    # the remote source changes.  ml_source becomes the local copy when one was
+    # made, so everything below -- tracing, appends, and the map export -- works
+    # from one consistent set of object IDs.
+    ml_source_remote = ml_source
+    ml_source, cached_network = _setup_phase4_cache(arcpy, config, ml_source, log_fn)
+    if ml_source != ml_source_remote:
+        log_fn(f"Using local ML copy for Phase 4: {ml_source}")
+
     assetnum_set = set(new_assetnums.values())
-    with arcpy.da.SearchCursor(ml_source, ["MXASSETNUM", "SHAPE@", "OID@"]) as cursor:
-        for row in cursor:
-            assetnum = _norm_id(row[0])
-            if assetnum in assetnum_set and row[1] is not None:
-                assetnum_segments.setdefault(assetnum, []).append((row[2], row[1]))
+    assetnum_segments = _read_assetnum_segments(
+        arcpy, ml_source, assetnum_set, config, log_fn
+    )
 
     log_fn(f"Matched {len(assetnum_segments)}/{len(assetnum_set)} assetnums to geometry in ML source")
 
@@ -1001,9 +1165,12 @@ def run(log_fn):
         start_geom = hfml["geom"]
         log_fn(f"--- HFML {i}/{len(new_hfmls)}: pmnum {pmnum} ---")
 
-        directed_net, geoms, pipe_ups, pipe_dns, use_nodes = _build_directed_network(
-            arcpy, ml_source, start_geom, log_fn,
-        )
+        if cached_network is not None:
+            directed_net, geoms, pipe_ups, pipe_dns, use_nodes = cached_network
+        else:
+            directed_net, geoms, pipe_ups, pipe_dns, use_nodes = _build_directed_network(
+                arcpy, ml_source, start_geom, log_fn,
+            )
 
         # Use the HFML's own OIDs.  Matching it by endpoint coordinates could pick
         # another pipe between the same two manholes — and one digitized the
@@ -1016,10 +1183,15 @@ def run(log_fn):
         )
 
         if seed_oid is None:
+            reason = (
+                "feature not in the cached network — the ML source may have changed "
+                "since the cache was built"
+                if cached_network is not None
+                else "feature not in spatially filtered area"
+            )
             log_fn(
                 f"  ERROR: seed OID {hfml['oids'][0]} not found in network for pmnum {pmnum} — "
-                "feature not in spatially filtered area. "
-                "Skipping HFML (will not appear in manifest)."
+                f"{reason}. Skipping HFML (will not appear in manifest)."
             )
             continue
 
@@ -1084,6 +1256,13 @@ def run(log_fn):
             log_fn(f"Exporting map for HFML {pmnum}...")
             record["pdf_path"], record["draft_aprx_path"] = run_output_paths(run_dir, pmnum)
             record["aprx_path"] = aprx_path
+            # The map export runs in a separate process that loads config.json
+            # itself.  The object IDs in this record belong to whichever ML
+            # source Phase 4 actually read, so tell it which one that was --
+            # otherwise a local copy's IDs would be looked up in the remote
+            # source and the map would be drawn from the wrong features.
+            if ml_source != ml_source_remote:
+                record["source_overrides"] = {"p4_ml_source_path": ml_source}
             export_hfml_map_out_of_process(record, config, log_fn)
         except Exception as exc:
             log_fn(f"  ERROR: HFML {pmnum} failed — {exc}")

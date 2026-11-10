@@ -48,6 +48,50 @@ The pipeline runs inside ArcGIS Pro's Python environment, which needs `pyodbc`, 
 
 Edits to the backend scripts take effect on the next run without restarting Pro. After editing `SASD_HFML.pyt` itself, right-click the toolbox and choose **Refresh**.
 
+## Phase 4 caching
+
+Phase 4 used to rebuild its directed pipe network once per HFML, each time
+selecting every pipe within 50,000 feet and reading those geometries over the
+wire from `\\pwnb1`. With five HFMLs that was five near-full reads of the
+gravity main layer per run.
+
+It now reads the share once, when the source actually changes:
+
+- the ML source is copied to a local file geodatabase,
+- the directed network is built once over its full extent and pickled,
+- both are reused until the source's feature count or geodatabase timestamps
+  change (or `p4_cache_max_age_days` passes),
+- the assetnum lookup asks the source for the assetnums being mapped instead of
+  reading every row.
+
+The cache lives in the system temp folder by default. Nothing needs to be added
+to `config.json` — these keys are optional and default to on:
+
+| key | default | what it does |
+| --- | --- | --- |
+| `p4_cache_enabled` | `true` | `false` restores the old per-HFML build |
+| `p4_cache_dir` | `""` | absolute local path; empty means system temp |
+| `p4_cache_max_age_days` | `7` | rebuild this often even if the source looks unchanged; `0` disables |
+| `p4_cache_local_ml_copy` | `true` | copy the ML source to local disk |
+| `p4_filter_assetnum_scan` | `true` | filter the assetnum lookup in the query |
+
+### One effect on the maps
+
+The cached network covers the whole ML source, so a trace is no longer cut off
+at the 50,000-foot buffer edge. An HFML whose upstream run fits inside that
+buffer traces identically; one with a longer run now traces to its real end,
+which is the correct result but a change from previous months. Compare a few
+PDFs against last month's before trusting a batch.
+
+### Object IDs
+
+Copying features to a new geodatabase renumbers OBJECTID. Phase 4 carries ML
+object IDs through tracing, appending and the map export, so when the local copy
+is in use every one of those steps reads that same copy — the export subprocess
+is told which path to use via `source_overrides` in its job record. Changing one
+of those call sites to read `config["p4_ml_source_path"]` directly would draw
+maps from whatever features happen to hold those IDs remotely.
+
 ## Deploying code to the shared network folder
 
 The shared network that hosts the GIS project has no git access, so the shared
