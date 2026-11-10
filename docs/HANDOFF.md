@@ -17,7 +17,7 @@ requirements.txt — pip dependencies
 - `SASD_HFML.pyt` — single "Run HFML Pipeline" geoprocessing tool: runs phases 1–5 in order inside ArcGIS Pro, logs to the Geoprocessing pane, halts on the first failure. Reloads backend modules on each run so code edits apply without restarting Pro.
 
 **Backend — all phases wired into the toolbox via `run(log_fn)` signature**
-- `backend/phase1/run.py` — full skeleton: SQL query → CSV → Excel `import` sheet
+- `backend/phase1/run.py` — full skeleton: SQL query → DataFrame → Excel `import` sheet (values written typed, not via CSV)
 - `backend/phase2/run.py` — full skeleton: detect added MLs + frequency changes, append to mainlines, delete import sheet, write `temp/added_mls.json`
 - `backend/phase3/run.py` — skeleton: arcpy ExcelToTable + Append upsert with field mapping
 - `backend/phase4/run.py` — skeleton: loop over added HFMLs, recursive upstream ML trace, append MLs → select contacting LLs → append LLs → select intersecting parcels → append parcels
@@ -46,6 +46,8 @@ Note: phases 3–5 require `arcpy`, so the pipeline can only be run end-to-end o
 ### Phase 4
 - Confirm `LL_SOURCE`, `LL_DEST`, `PARCELS_SOURCE`, `PARCELS_DEST` layer names in `backend/phase4/run.py`
 - LL contact uses `WITHIN_A_DISTANCE` plus endpoint filtering because LLs can have small gaps from MLs; tolerance is currently `1 Foot`
+- An LL end that lies in no parcel takes the nearest parcel within `PARCEL_SEARCH_FEET` (5 ft); the log reports how far those matches were, so the value can be tuned
+- `MAX_AGAINST_FLOW_RUN` (10) caps how many pipes digitized against the flow the trace follows from one manhole; longer runs are reported in a `NOTE:` log line instead. Fixing the direction in the GIS data (Flip Line) is the permanent fix for any pipe listed there
 
 ### Phase 5
 - Open the `.aprx` templates and confirm:

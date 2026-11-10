@@ -43,6 +43,29 @@ PATH_KEYS = [
 ]
 
 
+# Optional keys, with the defaults used when config.json does not list them.
+# Keeping them optional means an existing config.json -- including the copy on
+# the shared network folder -- keeps working untouched.
+OPTIONAL_DEFAULTS = {
+    # Phase 4 caching.  The cache holds a local copy of the ML source and the
+    # directed pipe network built from it, so the network share is read once
+    # when it changes rather than once per HFML.
+    "p4_cache_enabled": True,
+    # Must be an ABSOLUTE path on a local disk.  Empty means "use the system
+    # temp folder", which is what you want: the project folder itself lives on
+    # the share for shared users, so caching there would cache nothing useful.
+    "p4_cache_dir": "",
+    # Rebuild the cache at least this often even if the source looks unchanged.
+    # 0 disables the age check.
+    "p4_cache_max_age_days": 7,
+    # Copy the ML source to the local cache geodatabase.
+    "p4_cache_local_ml_copy": True,
+    # Ask the ML source only for the assetnums being mapped, instead of reading
+    # every row and filtering in Python.
+    "p4_filter_assetnum_scan": True,
+}
+
+
 def _resolve_path(path):
     if not isinstance(path, str) or not path:
         return path
@@ -64,5 +87,8 @@ def load_config():
 
     for key in PATH_KEYS:
         config[key] = _resolve_path(config[key])
+
+    for key, default in OPTIONAL_DEFAULTS.items():
+        config.setdefault(key, default)
 
     return config

@@ -6,6 +6,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 
 import json
 
+from backend.phase4.network_cache import (
+    Phase4Cache, dataset_signature, default_cache_dir, signature_is_weak,
+)
 from config_loader import load_config
 
 BUFFER_DISTANCE = "50000 Feet"
@@ -13,7 +16,16 @@ LL_SEARCH_DISTANCE = "1 Foot"
 # Same distance in map units (feet), for excluding LLs that only tie in at the
 # HFML's downstream manhole.
 DOWNSTREAM_MANHOLE_TOLERANCE = 1.0
+# Laterals often stop a little short of the property line, so an LL end that
+# lies in no parcel takes the nearest parcel within this many feet.
+PARCEL_SEARCH_FEET = 5.0
+# Longest run of pipes digitized against the flow the trace will follow from a
+# traced manhole; a longer run is treated as a real flow split (reported only).
+MAX_AGAINST_FLOW_RUN = 10
 ARCPY_RETRY_ATTEMPTS = 3
+# Beyond this a WHERE clause risks hitting backend query-length limits, so
+# the ML source is read in full and filtered in Python instead.
+MAX_WHERE_CLAUSE_CHARS = 30000
 # Beta testing: only map this many new HFMLs per run.  Raise (or remove) once
 # the full monthly batch should be processed.
 MAX_HFMLS_PER_RUN = 5
@@ -73,6 +85,17 @@ def _get_field_names(arcpy, dataset):
         lambda: [field.name for field in arcpy.ListFields(dataset)],
         f"Failed to list fields for {dataset}",
     )
+
+
+def _norm_id(value):
+    # PM_Mainlines, the HFML layer and the ML source don't necessarily store IDs
+    # with the same field type, so 500123, 500123.0 and "500123 " must match.
+    text = str(value).strip()
+    try:
+        number = float(text)
+    except ValueError:
+        return text
+    return str(int(number)) if number.is_integer() else text
 
 
 def _geom_to_temp_fc(arcpy, geom, name):
@@ -148,7 +171,11 @@ def _preflight_phase4(arcpy, config, log_fn):
 
 
 def _build_directed_network(arcpy, ml_source, start_geom, log_fn):
-    """Build a directed upstream network from the spatially filtered ML source.
+    """Build a directed upstream network from the ML source.
+
+    start_geom limits the network to pipes within BUFFER_DISTANCE of that
+    geometry.  Pass None to build over the whole source, which is what the
+    cached once-per-run build does.
 
     Direction is determined by (in priority order):
       1. UPNODE / DNNODE node-ID fields if present — explicit and reliable.
@@ -158,17 +185,26 @@ def _build_directed_network(arcpy, ml_source, start_geom, log_fn):
       directed_net  — dict: downstream_key → [(oid, upstream_key)]
                       "what pipes flow INTO this key"
       geoms         — dict: oid → (x1, y1, x2, y2) rounded coordinates
-      pipe_ups      — dict: oid → upstream_key  (to locate seed's upstream end)
+      pipe_ups      — dict: oid → upstream_key
+      pipe_dns      — dict: oid → downstream_key
+      use_nodes     — True when keys are node IDs rather than (x, y) coordinates
     """
-    log_fn(f"Spatially filtering network within {BUFFER_DISTANCE} of target HFML...")
-    seed_fc = _geom_to_temp_fc(arcpy, start_geom, "_SeedGeomNet")
-    _replace_temp_layer(arcpy, "_NetworkSource", ml_source)
-    arcpy.management.SelectLayerByLocation(
-        "_NetworkSource", "WITHIN_A_DISTANCE", seed_fc,
-        search_distance=BUFFER_DISTANCE,
-        selection_type="NEW_SELECTION"
-    )
-    arcpy.management.Delete(seed_fc)
+    if start_geom is None:
+        # Whole-extent build, used once per run and then cached.  Nothing is
+        # cut off at the buffer edge, so a trace with a long upstream run is
+        # followed to its real end rather than to 50,000 feet.
+        log_fn("Building the directed network over the full extent of the ML source...")
+        _replace_temp_layer(arcpy, "_NetworkSource", ml_source)
+    else:
+        log_fn(f"Spatially filtering network within {BUFFER_DISTANCE} of target HFML...")
+        seed_fc = _geom_to_temp_fc(arcpy, start_geom, "_SeedGeomNet")
+        _replace_temp_layer(arcpy, "_NetworkSource", ml_source)
+        arcpy.management.SelectLayerByLocation(
+            "_NetworkSource", "WITHIN_A_DISTANCE", seed_fc,
+            search_distance=BUFFER_DISTANCE,
+            selection_type="NEW_SELECTION"
+        )
+        arcpy.management.Delete(seed_fc)
 
     # Detect node-ID fields for explicit direction (case-insensitive search)
     _up_aliases = {"upnode", "us_node", "usnode", "fromnode", "node_f"}
@@ -188,6 +224,7 @@ def _build_directed_network(arcpy, ml_source, start_geom, log_fn):
     directed_net = {}  # dn_key → [(oid, up_key)]
     geoms     = {}     # oid   → (x1, y1, x2, y2)
     pipe_ups  = {}     # oid   → up_key
+    pipe_dns  = {}     # oid   → dn_key
 
     try:
         with arcpy.da.SearchCursor("_NetworkSource", cursor_fields) as cursor:
@@ -206,63 +243,167 @@ def _build_directed_network(arcpy, ml_source, start_geom, log_fn):
                     up_key, dn_key = fp, lp   # digitizing convention
 
                 pipe_ups[oid] = up_key
+                pipe_dns[oid] = dn_key
                 directed_net.setdefault(dn_key, []).append((oid, up_key))
     finally:
         if arcpy.Exists("_NetworkSource"):
             arcpy.management.Delete("_NetworkSource")
 
     log_fn(f"Directed network built from {len(geoms)} features ({len(directed_net)} nodes)")
-    return directed_net, geoms, pipe_ups
+    return directed_net, geoms, pipe_ups, pipe_dns, use_nodes
 
 
-def _trace_upstream_directed(seed_oid, directed_net, geoms, pipe_ups, log_fn=None):
-    """DFS upstream through a directed network.  Can only travel upstream because
-    directed_net only contains edges in the upstream direction.
+def _against_flow_run(start_oid, outflows, pipe_dns, visited, stop_keys, blocked_keys):
+    """start_oid is digitized away from a traced manhole, which already drains
+    through the pipe the trace climbed.  A gravity main can't end in nothing,
+    so if everything digitized onward from start_oid dead-ends (or runs back
+    into the traced area, stop_keys), those pipes are digitized against the
+    flow and really drain into the manhole: return them.  Return None for a
+    real flow split — the run reaches the HFML's downstream side (blocked_keys)
+    or goes on for more than MAX_AGAINST_FLOW_RUN pipes into the wider network.
+    """
+    run, todo, seen = [start_oid], [pipe_dns[start_oid]], set()
+    while todo:
+        key = todo.pop()
+        if key in seen or key in stop_keys:
+            continue
+        if key in blocked_keys:
+            return None
+        seen.add(key)
+        for oid in outflows.get(key, []):
+            if oid in visited or oid in run:
+                continue
+            run.append(oid)
+            if len(run) > MAX_AGAINST_FLOW_RUN:
+                return None
+            todo.append(pipe_dns[oid])
+    return run
+
+
+def _downstream_keys(dn_key, outflows, pipe_dns, seeds):
+    # Every manhole digitized downstream of the HFML.  None of them can be
+    # upstream of it, so the trace never enters them (e.g. through a loop).
+    keys, todo = set(), [dn_key]
+    while todo:
+        key = todo.pop()
+        if key in keys:
+            continue
+        keys.add(key)
+        todo.extend(pipe_dns[oid] for oid in outflows.get(key, []) if oid not in seeds)
+    return keys
+
+
+def _hfml_ends(seed_oids, pipe_ups, pipe_dns, outflows, infer_direction, log_fn):
+    """Return (upstream key, downstream key) of the HFML, whose segments
+    (seed_oids, longest first) join end to end."""
+    counts = {}
+    for oid in seed_oids:
+        for key in (pipe_ups[oid], pipe_dns[oid]):
+            counts[key] = counts.get(key, 0) + 1
+    ends = [key for key, n in counts.items() if n == 1]
+    dns = {pipe_dns[oid] for oid in seed_oids}
+    if len(ends) == 2 and (ends[0] in dns) != (ends[1] in dns):
+        up_key, dn_key = (ends[1], ends[0]) if ends[0] in dns else (ends[0], ends[1])
+    else:
+        # Not one consistently digitized chain: go by the longest segment.
+        up_key, dn_key = pipe_ups[seed_oids[0]], pipe_dns[seed_oids[0]]
+
+    if infer_direction:
+        seeds = set(seed_oids)
+        dn_out = [oid for oid in outflows.get(dn_key, []) if oid not in seeds]
+        up_out = [oid for oid in outflows.get(up_key, []) if oid not in seeds]
+        # Nothing drains out of the HFML's digitized downstream end, while its
+        # upstream end drains into the wider network: the HFML itself is
+        # digitized against the flow.
+        if not dn_out and any(
+            _against_flow_run(oid, outflows, pipe_dns, seeds, set(), set()) is None for oid in up_out
+        ):
+            log_fn("  NOTE: the HFML appears digitized against the flow — tracing upstream from its other end")
+            up_key, dn_key = dn_key, up_key
+    return up_key, dn_key
+
+
+def _trace_upstream_directed(seed_oids, directed_net, pipe_ups, pipe_dns, infer_direction=True, log_fn=None):
+    """DFS upstream from the HFML (seed_oids: its segments, longest first).
+    Returns (upstream OIDs, the HFML's downstream key).
+
+    Pipes flowing into a traced manhole are followed.  With infer_direction
+    (keys are coordinates, so direction comes from digitizing), pipes digitized
+    against the flow are followed too (see _against_flow_run), and an HFML
+    digitized against the flow is traced from its other end.
 
     Every map is cleaned up after export, so pipes already present in the
     destination (e.g. from older runs) are traced through like any other.
     """
-    if seed_oid is None:
-        if log_fn:
-            log_fn("Upstream trace skipped: seed OID not found in network")
-        return []
+    log = log_fn or (lambda msg: None)
+    outflows = {}
+    for oid, key in pipe_ups.items():
+        outflows.setdefault(key, []).append(oid)
 
-    seed_up_key = pipe_ups.get(seed_oid)
-    if seed_up_key is None:
-        if log_fn:
-            log_fn("Upstream trace skipped: seed pipe has no upstream key")
-        return []
+    seeds = set(seed_oids)
+    up_key, dn_key = _hfml_ends(seed_oids, pipe_ups, pipe_dns, outflows, infer_direction, log)
+    blocked = _downstream_keys(dn_key, outflows, pipe_dns, seeds)
+    # Every manhole along the HFML except its downstream end: side mains can
+    # join an HFML that is split into several segments part-way along.
+    start_keys = ({pipe_ups[oid] for oid in seeds} | {pipe_dns[oid] for oid in seeds}) - {dn_key}
+    # If nothing flows out of the HFML's downstream end (a lift station, or a
+    # pipe there digitized against the flow) its direction is unconfirmed, and
+    # a pipe leaving its upstream end could be the real downstream main, so
+    # don't follow those.
+    confirmed = any(oid not in seeds for oid in outflows.get(dn_key, []))
 
-    visited   = {seed_oid}
-    to_append = []
-    stack     = [seed_up_key]
-
-    visited_keys = set()
+    visited = set(seeds)
+    to_append, against_flow, looped = [], [], []
+    stack, queued = list(start_keys), set(start_keys)
     while stack:
         key = stack.pop()
-        visited_keys.add(key)
-        for feat_id, up_key in directed_net.get(key, []):
-            if feat_id in visited:
+        for oid, from_key in directed_net.get(key, []):
+            if oid in visited:
                 continue
-            visited.add(feat_id)
-            to_append.append(feat_id)
-            stack.append(up_key)
+            if from_key in blocked:
+                looped.append(oid)
+                continue
+            visited.add(oid)
+            to_append.append(oid)
+            if from_key not in queued:
+                queued.add(from_key)
+                stack.append(from_key)
+        if not infer_direction or (key in start_keys and not confirmed):
+            continue
+        for oid in outflows.get(key, []):
+            if oid in visited:
+                continue
+            for run_oid in _against_flow_run(oid, outflows, pipe_dns, visited, queued, blocked) or []:
+                visited.add(run_oid)
+                to_append.append(run_oid)
+                against_flow.append(run_oid)
+                if pipe_dns[run_oid] not in queued:
+                    queued.add(pipe_dns[run_oid])
+                    stack.append(pipe_dns[run_oid])
 
-    if log_fn:
-        log_fn(f"Upstream trace found {len(to_append)} pipes from seed upstream key {seed_up_key!r}")
-        # Pipes that START at a traced node flow away from it.  Apart from real
-        # flow splits, these are usually pipes digitized against the flow, which
-        # the trace can't follow — list them so a missing branch can be checked.
-        outflow = sorted(
-            oid for oid, up_key in pipe_ups.items()
-            if up_key in visited_keys and oid not in visited
+    log(f"Upstream trace found {len(to_append)} pipes from the HFML's upstream end {up_key!r}")
+    if against_flow:
+        log(
+            f"  Followed {len(against_flow)} pipe(s) digitized against the flow (they lead only to "
+            f"dead ends or back into the trace): {_preview_oids(sorted(against_flow))}"
         )
-        if outflow:
-            log_fn(
-                f"  NOTE: {len(outflow)} pipe(s) start at a traced manhole and were not followed "
-                f"(possibly digitized against flow): {_preview_oids(outflow)}"
-            )
-    return to_append
+    looped = sorted(set(looped) - visited)
+    if looped:
+        log(
+            f"  NOTE: {len(looped)} pipe(s) run from the HFML's downstream side into a traced manhole "
+            f"and were not followed (a loop or reversed duplicate): {_preview_oids(looped)}"
+        )
+    # Pipes that START at a traced manhole and weren't followed: real flow
+    # splits, or runs digitized against the flow that join the wider network —
+    # list them so a missing branch can be checked.
+    outflow = sorted({oid for key in queued for oid in outflows.get(key, []) if oid not in visited})
+    if outflow:
+        log(
+            f"  NOTE: {len(outflow)} pipe(s) start at a traced manhole and were not followed "
+            f"(a flow split, or digitized against the flow beyond what the trace can infer): "
+            f"{_preview_oids(outflow)}"
+        )
+    return to_append, dn_key
 
 
 def _append_by_oids(arcpy, oid_list, source, destination):
@@ -318,12 +459,22 @@ def _delete_rows_after(arcpy, path, max_oid):
 def _cleanup_destinations(arcpy, snapshot, log_fn):
     """Remove every row appended since the snapshot so the destinations look
     as if this HFML was never traced.  The exported PDF is the only output."""
+    leftovers = []
     for path, max_oid in snapshot.items():
         try:
             deleted = _delete_rows_after(arcpy, path, max_oid)
             log_fn(f"  Cleaned up {deleted} row(s) from {path}")
         except Exception as exc:
-            log_fn(f"  WARNING: cleanup failed for {path} — {exc}")
+            log_fn(f"  ERROR: cleanup failed for {path} — {exc}")
+            leftovers.append(f"{path} (OBJECTID > {max_oid})")
+    if leftovers:
+        # Stop rather than carry on: leftover rows would be drawn on later maps,
+        # and a leftover HFML seed makes its pmnum count as already mapped.
+        raise RuntimeError(
+            "Could not remove the rows appended for this HFML from: "
+            + "; ".join(leftovers)
+            + ". Delete those rows by hand, then rerun Phase 4."
+        )
 
 
 def _write_phase4_map_manifest(hfml_records, log_fn):
@@ -575,12 +726,40 @@ def _select_parcels_intersecting_lls(
             parcel_endpoint_fc,
         )
 
-        # CONTAINS includes points on parcel boundaries (unlike COMPLETELY_CONTAINS),
-        # catching LL endpoints that land exactly on a shared parcel edge.
+        # Each parcel-side end takes the parcel(s) it lies in or on (a shared
+        # edge gives both); an end that lies in no parcel takes the nearest one
+        # within PARCEL_SEARCH_FEET.
         arcpy.management.SelectLayerByLocation(
-            parcels_layer, "CONTAINS", parcel_endpoint_layer, selection_type="NEW_SELECTION"
+            parcels_layer, "WITHIN_A_DISTANCE", parcel_endpoint_layer,
+            search_distance=f"{PARCEL_SEARCH_FEET} Feet", selection_type="NEW_SELECTION",
         )
-        return [row[0] for row in arcpy.da.SearchCursor(parcels_layer, ["OBJECTID"])]
+        with arcpy.da.SearchCursor(parcels_layer, ["OBJECTID", "SHAPE@"]) as cursor:
+            candidates = [(oid, geom, geom.extent) for oid, geom in cursor if geom is not None]
+        chosen, nearest_used, unmatched = set(), [], 0
+        tol = PARCEL_SEARCH_FEET
+        with arcpy.da.SearchCursor(parcel_endpoint_layer, ["SHAPE@"]) as cursor:
+            for (end,) in cursor:
+                pt = end.firstPoint
+                dists = sorted(
+                    (geom.distanceTo(end), oid) for oid, geom, ext in candidates
+                    if ext.XMin - tol <= pt.X <= ext.XMax + tol and ext.YMin - tol <= pt.Y <= ext.YMax + tol
+                )
+                dists = [(d, oid) for d, oid in dists if d <= tol]
+                if not dists:
+                    unmatched += 1
+                elif dists[0][0] <= 0.001:
+                    chosen.update(oid for d, oid in dists if d <= 0.001)
+                else:
+                    chosen.add(dists[0][1])
+                    nearest_used.append(dists[0][0])
+        if log_fn and nearest_used:
+            log_fn(
+                f"  {len(nearest_used)} LL end(s) lie in no parcel — used the nearest parcel "
+                f"(up to {max(nearest_used):.1f} ft away)"
+            )
+        if log_fn and unmatched:
+            log_fn(f"  {unmatched} LL end(s) have no parcel within {tol:g} ft")
+        return sorted(chosen)
     finally:
         if ml_layer is not None and arcpy.Exists(ml_layer):
             arcpy.management.Delete(ml_layer)
@@ -598,7 +777,7 @@ def _select_parcels_intersecting_lls(
             arcpy.management.Delete(parcel_endpoint_fc)
 
 
-def _append_seed_to_hfml_layer(arcpy, seed_oid, ml_source, hfml_layer, pmnum, pm_mainlines_path, log_fn):
+def _append_seed_to_hfml_layer(arcpy, seed_oids, ml_source, hfml_layer, pmnum, pm_mainlines_path, log_fn):
     pmnum_field = "PM_Mainlines_pmnum"
     layer_fields = _get_field_names(arcpy, hfml_layer)
     has_pmnum_field = pmnum_field in layer_fields
@@ -612,7 +791,7 @@ def _append_seed_to_hfml_layer(arcpy, seed_oid, ml_source, hfml_layer, pmnum, pm
 
     max_oid = _get_max_oid(arcpy, hfml_layer)
 
-    _append_by_oids(arcpy, [seed_oid], ml_source, hfml_layer)
+    _append_by_oids(arcpy, list(seed_oids), ml_source, hfml_layer)
 
     if not has_pmnum_field:
         log_fn(f"  HFML seed appended for pmnum {pmnum} ('{pmnum_field}' not found — attributes not stamped)")
@@ -683,6 +862,188 @@ def _coerce_for_field(value, field_type):
     return value
 
 
+def _asset_chain(segments):
+    """Split one asset's GIS segments [(oid, geom)] into the HFML and the rest.
+
+    Segments joined end to end form a group; the HFML is the group with the
+    most segments, then the most length (pieces of one asset don't join up by
+    accident, while a stray copy of the asset number is usually a lone pipe),
+    longest segment first.  The rest are the other groups and exact copies of
+    a segment.
+    """
+    def ends(geom):
+        return frozenset({
+            (round(geom.firstPoint.X, 3), round(geom.firstPoint.Y, 3)),
+            (round(geom.lastPoint.X, 3), round(geom.lastPoint.Y, 3)),
+        })
+
+    remaining = sorted(segments, key=lambda seg: seg[1].length, reverse=True)
+    groups, copies = [], []
+    while remaining:
+        group = [remaining.pop(0)]
+        group_ends = set(ends(group[0][1]))
+        seen_ends = {ends(group[0][1])}
+        grown = True
+        while grown:
+            grown = False
+            for seg in list(remaining):
+                seg_ends = ends(seg[1])
+                if not seg_ends & group_ends:
+                    continue
+                remaining.remove(seg)
+                if seg_ends in seen_ends:
+                    copies.append(seg)
+                    continue
+                group.append(seg)
+                group_ends |= seg_ends
+                seen_ends.add(seg_ends)
+                grown = True
+        groups.append(group)
+    best = max(groups, key=lambda g: (len(g), sum(seg[1].length for seg in g)))
+    return best, [seg for g in groups if g is not best for seg in g] + copies
+
+
+def _assetnum_where_clause(arcpy, ml_source, assetnums):
+    """A WHERE clause selecting only these assetnums, or None to read every row.
+
+    PM_Mainlines, the HFML layer and the ML source do not agree on field type,
+    so one assetnum can be stored as 500123, 500123.0 or "500123 " (this is what
+    _norm_id exists for).  For a text field both plain and ".0" spellings are
+    listed; for a numeric field the numeric form is used.  Anything that cannot
+    be expressed safely returns None, and the caller then reads every row as it
+    did before -- a slower scan is always better than a silently missed HFML.
+    """
+    if not assetnums:
+        return None
+    try:
+        field = next(
+            (f for f in arcpy.ListFields(ml_source) if f.name.lower() == "mxassetnum"),
+            None,
+        )
+        if field is None:
+            return None
+        delimited = arcpy.AddFieldDelimiters(ml_source, field.name)
+        if field.type in ("String", "Guid"):
+            spellings = set()
+            for assetnum in assetnums:
+                spellings.add(str(assetnum))
+                spellings.add(f"{assetnum}.0")
+            literals = ", ".join(
+                "'" + value.replace("'", "''") + "'" for value in sorted(spellings)
+            )
+        else:
+            numbers = set()
+            for assetnum in assetnums:
+                try:
+                    numbers.add(str(int(float(assetnum))))
+                except (TypeError, ValueError):
+                    # Not expressible as a number against a numeric field.
+                    return None
+            literals = ", ".join(sorted(numbers))
+        if not literals:
+            return None
+        clause = f"{delimited} IN ({literals})"
+        if len(clause) > MAX_WHERE_CLAUSE_CHARS:
+            return None
+        return clause
+    except Exception:
+        return None
+
+
+def _read_assetnum_segments(arcpy, ml_source, assetnum_set, config, log_fn):
+    """Map each wanted assetnum to its (oid, geometry) segments in the ML source.
+
+    Asks the source for just those assetnums when it can.  If that returns
+    nothing at all while assetnums were wanted, the clause is assumed wrong for
+    how this source stores them and every row is read instead.
+    """
+    def _scan(where):
+        found = {}
+        with arcpy.da.SearchCursor(
+            ml_source, ["MXASSETNUM", "SHAPE@", "OID@"], where
+        ) as cursor:
+            for row in cursor:
+                assetnum = _norm_id(row[0])
+                if assetnum in assetnum_set and row[1] is not None:
+                    found.setdefault(assetnum, []).append((row[2], row[1]))
+        return found
+
+    where = None
+    if config.get("p4_filter_assetnum_scan", True):
+        where = _assetnum_where_clause(arcpy, ml_source, assetnum_set)
+        if where is None:
+            log_fn("  Reading the whole ML source (no safe assetnum filter available)")
+        else:
+            log_fn(f"  Asking the ML source for {len(assetnum_set)} assetnum(s) only")
+
+    segments = _scan(where)
+    if where is not None and not segments and assetnum_set:
+        log_fn(
+            "  WARNING: the assetnum filter matched nothing — falling back to a "
+            "full scan of the ML source"
+        )
+        segments = _scan(None)
+    return segments
+
+
+def _setup_phase4_cache(arcpy, config, ml_source, log_fn):
+    """Prepare the local cache.
+
+    Returns (ml_source_to_use, directed_network_or_None).  The network is None
+    when caching is off or unusable, and Phase 4 then builds a spatially
+    filtered network per HFML exactly as it used to.
+
+    Note the returned path may be a LOCAL COPY of the ML source, whose
+    OBJECTIDs differ from the remote original.  Every later step that takes ML
+    object IDs -- tracing, appending, and the map export subprocess -- must use
+    the returned path.
+    """
+    if not config.get("p4_cache_enabled", True):
+        log_fn("Phase 4 cache disabled in config.json — building the network per HFML")
+        return ml_source, None
+
+    cache_dir = config.get("p4_cache_dir") or ""
+    if cache_dir and not os.path.isabs(cache_dir):
+        log_fn(
+            f"  WARNING: p4_cache_dir must be an absolute local path — ignoring {cache_dir!r}"
+        )
+        cache_dir = ""
+    cache = Phase4Cache(
+        cache_dir or default_cache_dir(),
+        config.get("p4_cache_max_age_days", 7),
+        log_fn,
+    )
+    log_fn(f"Phase 4 cache folder: {cache.dir}")
+
+    signature = dataset_signature(arcpy, ml_source)
+    log_fn(f"  ML source fingerprint: {signature}")
+    if signature_is_weak(signature):
+        log_fn(
+            "  NOTE: only a feature count is available for this source, so an edit "
+            "that leaves the count unchanged would go unnoticed; the cache age "
+            "limit is the backstop."
+        )
+
+    effective = ml_source
+    if config.get("p4_cache_local_ml_copy", True):
+        local = cache.local_ml_copy(arcpy, ml_source, signature)
+        if local:
+            effective = local
+
+    network = cache.load_network(effective, signature)
+    if network is None:
+        started = time.time()
+        try:
+            network = _build_directed_network(arcpy, effective, None, log_fn)
+        except Exception as exc:
+            log_fn(f"  WARNING: whole-extent network build failed — {exc}")
+            log_fn("  Falling back to the per-HFML filtered build.")
+            return effective, None
+        log_fn(f"  Built the directed network in {time.time() - started:.1f}s")
+        cache.save_network(effective, signature, network)
+    return effective, network
+
+
 def run(log_fn):
     # Imported here: phase5 imports PHASE4_MAP_OUTPUT_PATH from this module.
     from backend.phase5.run import (
@@ -719,23 +1080,23 @@ def run(log_fn):
     with arcpy.da.SearchCursor(pm_mainlines_path, [config["unique_id_field"], "assetnum"]) as cursor:
         for row in cursor:
             if row[1] is not None:
-                all_assetnums[str(row[0])] = str(row[1])
+                all_assetnums[str(row[0])] = _norm_id(row[1])
 
     log_fn(f"Found {len(all_assetnums)} total HFMLs in PM_Mainlines")
 
     # Determine which pmnums are already done.  Each HFML's features are deleted
     # after its map is exported, so an existing PDF is what marks it as mapped.
     # Seeds left in PMs_SSGRAVITYMAIN by earlier runs also count.
-    mapped_pdfs = find_mapped_pdfs(config)
-    already_done = {p for p in all_assetnums if p in mapped_pdfs}
+    done_ids = {_norm_id(p) for p in find_mapped_pdfs(config)}
     try:
         with arcpy.da.SearchCursor(hfml_layer, ["PM_Mainlines_pmnum"]) as cursor:
             for (pmnum,) in cursor:
                 if pmnum is not None:
-                    already_done.add(str(pmnum))
+                    done_ids.add(_norm_id(pmnum))
     except Exception as exc:
         log_fn(f"  WARNING: could not read existing seeds from HFML layer — {exc}")
 
+    already_done = {p for p in all_assetnums if _norm_id(p) in done_ids}
     new_assetnums = {p: a for p, a in all_assetnums.items() if p not in already_done}
     log_fn(f"Already processed: {len(already_done)}, New to process: {len(new_assetnums)}")
 
@@ -744,33 +1105,42 @@ def run(log_fn):
         _write_phase4_map_manifest([], log_fn)
         return
 
-    assetnum_to_geom = {}
-    assetnum_to_len  = {}
-    assetnum_set = set(new_assetnums.values())
-    with arcpy.da.SearchCursor(ml_source, ["MXASSETNUM", "SHAPE@"]) as cursor:
-        for row in cursor:
-            assetnum = str(row[0])
-            if assetnum not in assetnum_set or row[1] is None:
-                continue
-            seg_len = row[1].length
-            if assetnum not in assetnum_to_geom:
-                assetnum_to_geom[assetnum] = row[1]
-                assetnum_to_len[assetnum]  = seg_len
-            elif seg_len > assetnum_to_len[assetnum]:
-                log_fn(f"  WARNING: duplicate MXASSETNUM {assetnum} — keeping longer segment ({seg_len:.1f} > {assetnum_to_len[assetnum]:.1f})")
-                assetnum_to_geom[assetnum] = row[1]
-                assetnum_to_len[assetnum]  = seg_len
-            else:
-                log_fn(f"  WARNING: duplicate MXASSETNUM {assetnum} — discarding shorter segment ({seg_len:.1f})")
+    # Local copy of the ML source plus the directed network, both reused until
+    # the remote source changes.  ml_source becomes the local copy when one was
+    # made, so everything below -- tracing, appends, and the map export -- works
+    # from one consistent set of object IDs.
+    ml_source_remote = ml_source
+    ml_source, cached_network = _setup_phase4_cache(arcpy, config, ml_source, log_fn)
+    if ml_source != ml_source_remote:
+        log_fn(f"Using local ML copy for Phase 4: {ml_source}")
 
-    log_fn(f"Matched {len(assetnum_to_geom)}/{len(assetnum_set)} assetnums to geometry in ML source")
+    assetnum_set = set(new_assetnums.values())
+    assetnum_segments = _read_assetnum_segments(
+        arcpy, ml_source, assetnum_set, config, log_fn
+    )
+
+    log_fn(f"Matched {len(assetnum_segments)}/{len(assetnum_set)} assetnums to geometry in ML source")
 
     new_hfmls = []
     for pmnum, assetnum in new_assetnums.items():
-        if assetnum in assetnum_to_geom:
-            new_hfmls.append({"pmnum": pmnum, "geom": assetnum_to_geom[assetnum]})
-        else:
+        segments = assetnum_segments.get(assetnum)
+        if not segments:
             log_fn(f"  pmnum {pmnum} assetnum {assetnum} has no geometry in ML source — skipping")
+            continue
+        # One asset can be split into several GIS segments; the HFML is all of
+        # the segments joined end to end (see _asset_chain).
+        chain, stray = _asset_chain(segments)
+        if len(chain) > 1:
+            log_fn(
+                f"  MXASSETNUM {assetnum} is split into {len(chain)} connected segments "
+                f"{_preview_oids([oid for oid, _ in chain])} — mapping them all as the HFML"
+            )
+        for oid, geom in stray:
+            log_fn(
+                f"  WARNING: duplicate MXASSETNUM {assetnum} — OID {oid} ({geom.length:.1f} ft) "
+                "is a copy of, or doesn't connect to, the rest of the asset; ignored"
+            )
+        new_hfmls.append({"pmnum": pmnum, "geom": chain[0][1], "oids": [oid for oid, _ in chain]})
 
     if not new_hfmls:
         log_fn("No new HFMLs resolved to geometry — Phase 4 complete")
@@ -795,26 +1165,33 @@ def run(log_fn):
         start_geom = hfml["geom"]
         log_fn(f"--- HFML {i}/{len(new_hfmls)}: pmnum {pmnum} ---")
 
-        directed_net, geoms, pipe_ups = _build_directed_network(arcpy, ml_source, start_geom, log_fn)
+        if cached_network is not None:
+            directed_net, geoms, pipe_ups, pipe_dns, use_nodes = cached_network
+        else:
+            directed_net, geoms, pipe_ups, pipe_dns, use_nodes = _build_directed_network(
+                arcpy, ml_source, start_geom, log_fn,
+            )
 
-        # Find the seed HFML's own OID in the network by coordinate match
-        seed_x1 = round(start_geom.firstPoint.X, 3)
-        seed_y1 = round(start_geom.firstPoint.Y, 3)
-        seed_x2 = round(start_geom.lastPoint.X,  3)
-        seed_y2 = round(start_geom.lastPoint.Y,  3)
-        seed_oid = next(
-            (oid for oid, (x1, y1, x2, y2) in geoms.items()
-             if (x1 == seed_x1 and y1 == seed_y1 and x2 == seed_x2 and y2 == seed_y2)
-             or (x1 == seed_x2 and y1 == seed_y2 and x2 == seed_x1 and y2 == seed_y1)),
-            None
+        # Use the HFML's own OIDs.  Matching it by endpoint coordinates could pick
+        # another pipe between the same two manholes — and one digitized the
+        # other way round would send the trace up from the downstream manhole.
+        seed_oids = [oid for oid in hfml["oids"] if oid in geoms]
+        seed_oid = hfml["oids"][0] if hfml["oids"][0] in geoms else None
+        log_fn(
+            f"Seed HFML OID in network: {seed_oid}"
+            + (f" (+ {len(seed_oids) - 1} more segment(s) of the same asset)" if len(seed_oids) > 1 else "")
         )
-        log_fn(f"Seed HFML OID in network: {seed_oid}")
 
         if seed_oid is None:
+            reason = (
+                "feature not in the cached network — the ML source may have changed "
+                "since the cache was built"
+                if cached_network is not None
+                else "feature not in spatially filtered area"
+            )
             log_fn(
-                f"  ERROR: seed OID not found in network for pmnum {pmnum} — "
-                "coordinate precision mismatch or feature not in spatially filtered area. "
-                "Skipping HFML (will not appear in manifest)."
+                f"  ERROR: seed OID {hfml['oids'][0]} not found in network for pmnum {pmnum} — "
+                f"{reason}. Skipping HFML (will not appear in manifest)."
             )
             continue
 
@@ -822,25 +1199,33 @@ def run(log_fn):
         # removed once its map is exported (or if anything fails midway).
         snapshot = _snapshot_destinations(arcpy, dest_paths)
         try:
-            _append_seed_to_hfml_layer(arcpy, seed_oid, ml_source, config["p4_ml_layer_path"], pmnum, pm_mainlines_path, log_fn)
+            _append_seed_to_hfml_layer(arcpy, seed_oids, ml_source, config["p4_ml_layer_path"], pmnum, pm_mainlines_path, log_fn)
 
-            upstream_traced = _trace_upstream_directed(seed_oid, directed_net, geoms, pipe_ups, log_fn)
-            ml_oids = [seed_oid] + upstream_traced
+            upstream_traced, downstream_key = _trace_upstream_directed(
+                seed_oids, directed_net, pipe_ups, pipe_dns, infer_direction=not use_nodes, log_fn=log_fn,
+            )
+            ml_oids = seed_oids + upstream_traced
             log_fn(f"Traced ML count (incl. seed): {len(ml_oids)}")
             log_fn(f"Traced ML OID preview: {_preview_oids(ml_oids)}")
             # Exclude the seed from the upstream ML trace layer — it belongs only
             # in the HFML layer (already written above via _append_seed_to_hfml_layer).
-            upstream_ml_oids = [oid for oid in ml_oids if oid != seed_oid]
+            upstream_ml_oids = list(upstream_traced)
             _append_by_oids(arcpy, upstream_ml_oids, ml_source, ml_dest)
             log_fn(f"Appended {len(upstream_ml_oids)} upstream ML segments (seed excluded)")
 
             # LLs are found from the HFML and its upstream MLs only (ml_oids).
             # Selecting by the pipes that touch the HFML would also pull in the
-            # downstream ML's laterals and parcels.  The HFML's downstream end is
-            # its lastPoint (digitizing convention, as used by the trace).
+            # downstream ML's laterals and parcels.  The trace says which end of
+            # the HFML is downstream; with node fields its keys are node IDs, so
+            # use the digitized end (lastPoint) of the segment ending there.
+            if use_nodes:
+                bottom = next((oid for oid in seed_oids if pipe_dns[oid] == downstream_key), seed_oid)
+                downstream_point = (geoms[bottom][2], geoms[bottom][3])
+            else:
+                downstream_point = downstream_key
             ll_oids = _select_lls_contacting_mls(
                 arcpy, ml_oids, ml_source, ll_source,
-                downstream_point=(geoms[seed_oid][2], geoms[seed_oid][3]), log_fn=log_fn,
+                downstream_point=downstream_point, log_fn=log_fn,
             )
             log_fn(f"Selected LL count: {len(ll_oids)}")
             log_fn(f"Selected LL OID preview: {_preview_oids(ll_oids)}")
@@ -859,6 +1244,7 @@ def run(log_fn):
             record = {
                 "pmnum": pmnum,
                 "seed_oid": seed_oid,
+                "seed_oids": list(seed_oids),
                 # ml_oids = upstream traced pipes only (seed is in the HFML layer,
                 # not in ml_dest, so it is tracked separately via seed_oid).
                 "ml_oids": list(upstream_ml_oids),
@@ -870,6 +1256,13 @@ def run(log_fn):
             log_fn(f"Exporting map for HFML {pmnum}...")
             record["pdf_path"], record["draft_aprx_path"] = run_output_paths(run_dir, pmnum)
             record["aprx_path"] = aprx_path
+            # The map export runs in a separate process that loads config.json
+            # itself.  The object IDs in this record belong to whichever ML
+            # source Phase 4 actually read, so tell it which one that was --
+            # otherwise a local copy's IDs would be looked up in the remote
+            # source and the map would be drawn from the wrong features.
+            if ml_source != ml_source_remote:
+                record["source_overrides"] = {"p4_ml_source_path": ml_source}
             export_hfml_map_out_of_process(record, config, log_fn)
         except Exception as exc:
             log_fn(f"  ERROR: HFML {pmnum} failed — {exc}")
