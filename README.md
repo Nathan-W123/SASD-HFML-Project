@@ -74,6 +74,9 @@ to `config.json` — these keys are optional and default to on:
 | `p4_cache_max_age_days` | `7` | rebuild this often even if the source looks unchanged; `0` disables |
 | `p4_cache_local_ml_copy` | `true` | copy the ML source to local disk |
 | `p4_filter_assetnum_scan` | `true` | filter the assetnum lookup in the query |
+| `p4_node_snap_tolerance_feet` | `0.1` | pipe ends this far apart count as one manhole; `0` restores exact matching |
+| `p4_report_network_gaps` | `true` | log how close manholes sit without sharing a key (read-only) |
+| `p4_report_trace_gaps` | `true` | log unconnected pipe ends at the edge of each trace (read-only) |
 
 ### One effect on the maps
 
@@ -82,6 +85,41 @@ at the 50,000-foot buffer edge. An HFML whose upstream run fits inside that
 buffer traces identically; one with a longer run now traces to its real end,
 which is the correct result but a change from previous months. Compare a few
 PDFs against last month's before trusting a batch.
+
+## Why a branch of mainlines goes missing
+
+The trace matches manholes by exact key. Sewer data is rarely snapped to the
+thousandth of a foot, so two pipe ends a hundredth of a foot apart used to be
+two different manholes — the chain stopped there and every pipe above the gap
+was silently absent from the map, along with the laterals and parcels that would
+have come with them. A whole branch disappearing at once is the signature.
+
+Three things now address it:
+
+- `p4_node_snap_tolerance_feet` (default 0.1) snaps nearby pipe ends onto one
+  manhole when the network is built. Raising it closes larger gaps but also
+  merges manholes that really are that close, which invents connections — raise
+  it no further than the gap distances the log reports.
+- When a trace finishes, any unconnected pipe end within 2 feet of an edge of
+  the trace is logged with its OID and distance. That is what a cut-off branch
+  looks like, and it fires for partial traces, not just empty ones.
+- When the network cache is built, the spread of manhole-to-manhole distances
+  is logged in 0.01 / 0.1 / 0.5 / 1 foot buckets. That is the measurement that
+  should pick the tolerance above.
+
+Separately, an HFML digitized against the flow was traced from the wrong end
+when neither end drained anywhere. `_hfml_ends` now breaks that tie on which
+end pipes arrive at. A genuine top-of-system HFML is untouched, because it has
+a downstream main leaving its downstream end and so never reaches that test.
+
+## Why a map draws fewer features than were appended
+
+Map layers are filtered to the camera extent, and the camera is built to contain
+everything Phase 4 appended, so the two counts should agree. When they don't,
+the export now says so: the layer report flags any layer drawing fewer features
+than were appended this run — or more, which means rows an earlier run left
+behind in `Data.gdb` are being drawn on this map — and names any appended
+feature that falls outside the map view or has no geometry in its source.
 
 ### Object IDs
 

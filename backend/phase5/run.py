@@ -311,7 +311,55 @@ def _norm_path(path):
     return os.path.normcase(os.path.normpath(str(path or ""))).rstrip("\\/")
 
 
-def _log_layer_report(arcpy, map_obj, hfml_id, config, log_fn):
+def _extent_overlaps(a, b):
+    return not (a.XMax < b.XMin or a.XMin > b.XMax or a.YMax < b.YMin or a.YMin > b.YMax)
+
+
+def _report_offscreen_features(arcpy, hfml, config, camera_extent, log_fn):
+    """Name any feature Phase 4 appended that lies outside the map view.
+
+    The map's layers are filtered to the camera extent, so an appended feature
+    outside it is in the geodatabase and absent from the PDF.  The camera is
+    built to contain everything appended, so this should always be empty --
+    when it is not, these OIDs are why a map draws fewer features than Phase 4
+    appended.  Read-only.
+    """
+    groups = (
+        ("upstream ML", hfml.get("ml_oids") or [], config["p4_ml_source_path"]),
+        ("LL", hfml.get("ll_oids") or [], config["p4_ll_source_path"]),
+        ("parcel", hfml.get("parcel_oids") or [], config["p4_parcels_source_path"]),
+    )
+    for label, oids, source_path in groups:
+        if not oids:
+            continue
+        offscreen, missing_geometry = [], []
+        try:
+            query = f"OBJECTID IN ({','.join(str(oid) for oid in oids)})"
+            seen = set()
+            with arcpy.da.SearchCursor(source_path, ["OID@", "SHAPE@"], query) as cursor:
+                for oid, geom in cursor:
+                    seen.add(oid)
+                    if geom is None:
+                        missing_geometry.append(oid)
+                    elif not _extent_overlaps(geom.extent, camera_extent):
+                        offscreen.append(oid)
+            missing_geometry.extend(oid for oid in oids if oid not in seen)
+        except Exception as exc:
+            log_fn(f"  WARNING: could not check {label} features against the map view — {exc}")
+            continue
+        if offscreen:
+            log_fn(
+                f"  WARNING: {len(offscreen)} appended {label} feature(s) lie outside the map view "
+                f"and will not be drawn: source OID(s) {sorted(offscreen)}"
+            )
+        if missing_geometry:
+            log_fn(
+                f"  WARNING: {len(missing_geometry)} appended {label} feature(s) have no geometry in "
+                f"the source: OID(s) {sorted(missing_geometry)}"
+            )
+
+
+def _log_layer_report(arcpy, map_obj, hfml_id, config, log_fn, hfml=None):
     """Log what each HFML/trace layer in the map points at and how many features
     it will draw, so a map missing the HFML or MLs shows why in the log."""
     expected = {
@@ -320,6 +368,14 @@ def _log_layer_report(arcpy, map_obj, hfml_id, config, log_fn):
         _norm_path(config["p4_ll_dest_path"]): "LL trace",
         _norm_path(config["p4_parcels_dest_path"]): "parcels trace",
     }
+    appended = {}
+    if hfml is not None:
+        appended = {
+            "HFML layer": len(hfml.get("seed_oids") or ([hfml["seed_oid"]] if hfml.get("seed_oid") else [])),
+            "ML trace": len(hfml.get("ml_oids") or []),
+            "LL trace": len(hfml.get("ll_oids") or []),
+            "parcels trace": len(hfml.get("parcel_oids") or []),
+        }
     seen = set()
     for layer in map_obj.listLayers():
         if layer.isGroupLayer or not layer.supports("DATASOURCE"):
@@ -345,9 +401,21 @@ def _log_layer_report(arcpy, map_obj, hfml_id, config, log_fn):
             renderer = f", symbology={r.type}" + (f" on {fields}" if fields else "")
         except Exception:
             pass
+        expected = appended.get(role)
+        note = ""
+        if expected is not None and isinstance(count, int) and count != expected:
+            if count < expected:
+                note = (
+                    f" — WARNING: {expected - count} of the {expected} appended this run are not drawn"
+                )
+            else:
+                note = (
+                    f" — WARNING: {count - expected} more than the {expected} appended this run, so "
+                    "rows left behind by an earlier run are being drawn on this map"
+                )
         log_fn(
             f"  Layer '{layer.name}' [{role or 'NOT a Phase 4 output'}] draws {count} feature(s)"
-            f"{renderer}; query={query!r}; source={source}"
+            f"{note}{renderer}; query={query!r}; source={source}"
         )
     for path, role in expected.items():
         if role not in seen:
@@ -859,8 +927,10 @@ def export_hfml_map(arcpy, hfml, config, today, observations_map, log_fn):
         # that are visible at the map margin from the trace layer definition queries.
         map_obj.referenceScale = 0  # disable scale-dependent symbol sizing
         _apply_camera_extent(arcpy, map_frame, extent, log_fn)
-        _scope_layers(arcpy, map_obj, hfml_id, map_frame.camera.getExtent(), log_fn)
-        _log_layer_report(arcpy, map_obj, hfml_id, config, log_fn)
+        camera_extent = map_frame.camera.getExtent()
+        _scope_layers(arcpy, map_obj, hfml_id, camera_extent, log_fn)
+        _log_layer_report(arcpy, map_obj, hfml_id, config, log_fn, hfml=hfml)
+        _report_offscreen_features(arcpy, hfml, config, camera_extent, log_fn)
         gridno = _lookup_gridno(arcpy, config, hfml_id)
         _set_text_elements(layout, hfml_id, gridno, today, log_fn)
         _try_add_callout(

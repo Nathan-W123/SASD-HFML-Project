@@ -63,6 +63,19 @@ OPTIONAL_DEFAULTS = {
     # Ask the ML source only for the assetnums being mapped, instead of reading
     # every row and filtering in Python.
     "p4_filter_assetnum_scan": True,
+    # Pipe ends this far apart (feet) are treated as the same manhole when the
+    # trace network is built.  The trace matches manholes exactly, so without
+    # this a pair of ends 0.01 ft apart breaks the chain and every pipe above
+    # the gap is missing from the map.  0 restores exact matching.  Raising it
+    # also merges manholes that really are that close, so raise it no further
+    # than the gap distances the log reports.
+    "p4_node_snap_tolerance_feet": 0.1,
+    # Report, once per cache build, how close manholes sit without sharing a
+    # key -- this is what should pick the tolerance above.  Read-only.
+    "p4_report_network_gaps": True,
+    # Report unconnected pipe ends just off the edge of each trace, which is
+    # what a cut-off branch looks like.  Read-only.
+    "p4_report_trace_gaps": True,
 }
 
 

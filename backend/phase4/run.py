@@ -26,6 +26,14 @@ ARCPY_RETRY_ATTEMPTS = 3
 # Beyond this a WHERE clause risks hitting backend query-length limits, so
 # the ML source is read in full and filtered in Python instead.
 MAX_WHERE_CLAUSE_CHARS = 30000
+# How far from the edge of a finished trace to look for an unconnected pipe
+# end.  Anything found is reported, never followed: a short distance is what a
+# gap in the data looks like, and the branch above it is missing from the map.
+GAP_REPORT_RADIUS_FEET = 2.0
+MAX_GAP_REPORT_LINES = 10
+# Buckets for the once-per-cache-build report on how close manholes sit to each
+# other without sharing a key.  The shape of this picks the snap tolerance.
+GAP_HISTOGRAM_BUCKETS = (0.01, 0.1, 0.5, 1.0)
 # Beta testing: only map this many new HFMLs per run.  Raise (or remove) once
 # the full monthly batch should be processed.
 MAX_HFMLS_PER_RUN = 5
@@ -170,7 +178,134 @@ def _preflight_phase4(arcpy, config, log_fn):
     log_fn(f"Parcels destination field count: {len(_get_field_names(arcpy, config['p4_parcels_dest_path']))}")
 
 
-def _build_directed_network(arcpy, ml_source, start_geom, log_fn):
+class _NodeSnapper:
+    """Maps pipe endpoints that are close together onto one shared key.
+
+    The trace matches manholes by exact key.  Sewer data is rarely snapped to
+    the thousandth of a foot, so two pipe ends 0.01 ft apart used to be two
+    different manholes -- the branch above the gap was unreachable and silently
+    missing from the map.  An endpoint within `tolerance` of an endpoint already
+    seen now takes that one's coordinates.
+
+    Keys stay (x, y) tuples, so everything downstream is unchanged -- including
+    the downstream-manhole point Phase 4 hands to the lateral filter.
+
+    Tolerance 0 restores the old behaviour (round to 3 decimals, exact match).
+    """
+
+    def __init__(self, tolerance):
+        self.tolerance = float(tolerance or 0.0)
+        # One grid cell per tolerance, so a 3x3 cell search always covers it.
+        self.cell = self.tolerance if self.tolerance > 0 else 1.0
+        self._grid = {}
+        self.snapped = 0
+
+    def key(self, x, y):
+        if self.tolerance <= 0:
+            return (round(x, 3), round(y, 3))
+        cx = int(math.floor(x / self.cell))
+        cy = int(math.floor(y / self.cell))
+        best, best_distance = None, None
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for rep in self._grid.get((cx + dx, cy + dy), ()):
+                    distance = math.hypot(x - rep[0], y - rep[1])
+                    if distance <= self.tolerance and (
+                        best_distance is None or distance < best_distance
+                    ):
+                        best, best_distance = rep, distance
+        if best is not None:
+            if best_distance > 0:
+                self.snapped += 1
+            return best
+        rep = (round(x, 3), round(y, 3))
+        self._grid.setdefault((cx, cy), []).append(rep)
+        return rep
+
+
+def _build_point_index(items, cell):
+    """Grid index over (x, y, payload) tuples, for nearest-point lookups."""
+    index = {}
+    for x, y, payload in items:
+        cx = int(math.floor(x / cell))
+        cy = int(math.floor(y / cell))
+        index.setdefault((cx, cy), []).append((x, y, payload))
+    return index
+
+
+def _near_points(index, cell, x, y, radius):
+    """Indexed points within radius of (x, y), nearest first.
+
+    Each entry is (distance, px, py, payload).
+    """
+    span = int(math.ceil(radius / cell))
+    cx = int(math.floor(x / cell))
+    cy = int(math.floor(y / cell))
+    found = []
+    for dx in range(-span, span + 1):
+        for dy in range(-span, span + 1):
+            for px, py, payload in index.get((cx + dx, cy + dy), ()):
+                distance = math.hypot(px - x, py - y)
+                if distance <= radius:
+                    found.append((distance, px, py, payload))
+    found.sort(key=lambda item: item[0])
+    return found
+
+
+def _endpoint_index(geoms):
+    """Index of every pipe end in the network, payload = its OID."""
+    def _points():
+        for oid, (x1, y1, x2, y2) in geoms.items():
+            yield (x1, y1, oid)
+            yield (x2, y2, oid)
+
+    return _build_point_index(_points(), GAP_REPORT_RADIUS_FEET)
+
+
+def _report_network_gaps(node_keys, log_fn):
+    """Report how close manholes sit to each other without sharing a key.
+
+    Read-only, and run once when the network cache is built.  A close pair is
+    not proof of a gap -- two parallel pipes can legitimately end a few inches
+    apart -- but a large 0.01-0.1 ft bucket means the data is not snapped, and
+    the shape of this is what should pick p4_node_snap_tolerance_feet.
+    """
+    coordinate_keys = [key for key in node_keys if isinstance(key, tuple) and len(key) == 2]
+    if not coordinate_keys:
+        return
+    radius = max(GAP_HISTOGRAM_BUCKETS)
+    index = _build_point_index(((x, y, None) for x, y in coordinate_keys), radius)
+    counts = {bucket: 0 for bucket in GAP_HISTOGRAM_BUCKETS}
+    closest = None
+    for x, y in coordinate_keys:
+        near = [item for item in _near_points(index, radius, x, y, radius) if item[0] > 0]
+        if not near:
+            continue
+        distance = near[0][0]
+        for bucket in GAP_HISTOGRAM_BUCKETS:
+            if distance <= bucket:
+                counts[bucket] += 1
+                break
+        if closest is None or distance < closest:
+            closest = distance
+    total = sum(counts.values())
+    if not total:
+        log_fn(f"  Manhole spacing: none within {radius:g} ft of another — the network looks snapped")
+        return
+    breakdown = ", ".join(
+        f"<={bucket:g} ft: {counts[bucket]}" for bucket in GAP_HISTOGRAM_BUCKETS if counts[bucket]
+    )
+    log_fn(
+        f"  Manhole spacing: {total} of {len(coordinate_keys)} manholes have another "
+        f"within {radius:g} ft but not at the same spot ({breakdown}); closest {closest:.4f} ft"
+    )
+    log_fn(
+        "  Those are candidate gaps in the data.  Set p4_node_snap_tolerance_feet "
+        "above the bucket holding most of them to close them."
+    )
+
+
+def _build_directed_network(arcpy, ml_source, start_geom, log_fn, snap_tolerance=0.0, report_gaps=False):
     """Build a directed upstream network from the ML source.
 
     start_geom limits the network to pipes within BUFFER_DISTANCE of that
@@ -221,6 +356,10 @@ def _build_directed_network(arcpy, ml_source, start_geom, log_fn):
 
     cursor_fields = ["SHAPE@", "OBJECTID"] + ([upnode_f, dnnode_f] if use_nodes else [])
 
+    snapper = _NodeSnapper(snap_tolerance)
+    if snapper.tolerance > 0:
+        log_fn(f"Snapping pipe ends within {snapper.tolerance:g} ft onto one manhole")
+
     directed_net = {}  # dn_key → [(oid, up_key)]
     geoms     = {}     # oid   → (x1, y1, x2, y2)
     pipe_ups  = {}     # oid   → up_key
@@ -232,8 +371,8 @@ def _build_directed_network(arcpy, ml_source, start_geom, log_fn):
                 geom, oid = row[0], row[1]
                 if geom is None:
                     continue
-                fp = (round(geom.firstPoint.X, 3), round(geom.firstPoint.Y, 3))
-                lp = (round(geom.lastPoint.X,  3), round(geom.lastPoint.Y,  3))
+                fp = snapper.key(geom.firstPoint.X, geom.firstPoint.Y)
+                lp = snapper.key(geom.lastPoint.X,  geom.lastPoint.Y)
                 geoms[oid] = (fp[0], fp[1], lp[0], lp[1])
 
                 if use_nodes:
@@ -250,6 +389,11 @@ def _build_directed_network(arcpy, ml_source, start_geom, log_fn):
             arcpy.management.Delete("_NetworkSource")
 
     log_fn(f"Directed network built from {len(geoms)} features ({len(directed_net)} nodes)")
+    if snapper.tolerance > 0:
+        log_fn(f"  {snapper.snapped} pipe end(s) snapped onto a nearby manhole")
+    if report_gaps and not use_nodes:
+        node_keys = set(pipe_ups.values()) | set(pipe_dns.values())
+        _report_network_gaps(node_keys, log_fn)
     return directed_net, geoms, pipe_ups, pipe_dns, use_nodes
 
 
@@ -293,7 +437,7 @@ def _downstream_keys(dn_key, outflows, pipe_dns, seeds):
     return keys
 
 
-def _hfml_ends(seed_oids, pipe_ups, pipe_dns, outflows, infer_direction, log_fn):
+def _hfml_ends(seed_oids, pipe_ups, pipe_dns, outflows, infer_direction, log_fn, directed_net=None):
     """Return (upstream key, downstream key) of the HFML, whose segments
     (seed_oids, longest first) join end to end."""
     counts = {}
@@ -320,10 +464,71 @@ def _hfml_ends(seed_oids, pipe_ups, pipe_dns, outflows, infer_direction, log_fn)
         ):
             log_fn("  NOTE: the HFML appears digitized against the flow — tracing upstream from its other end")
             up_key, dn_key = dn_key, up_key
+        elif not dn_out and not up_out and directed_net is not None:
+            # Neither end drains anywhere, so outflows cannot say which way the
+            # HFML runs and the digitized order is all we had.  Fall back to
+            # what arrives: upstream pipes flow INTO the HFML's upstream
+            # manhole, so inflows at one end only point that way.
+            #
+            # This cannot misread a genuine top-of-system HFML: that has a
+            # downstream main leaving its downstream end, which puts something
+            # in dn_out and stops us reaching here at all.
+            dn_in = [oid for oid, _ in directed_net.get(dn_key, []) if oid not in seeds]
+            up_in = [oid for oid, _ in directed_net.get(up_key, []) if oid not in seeds]
+            if dn_in and not up_in:
+                log_fn(
+                    "  NOTE: neither end of the HFML drains anywhere, and pipes arrive only at its "
+                    "digitized downstream end — treating that end as upstream"
+                )
+                up_key, dn_key = dn_key, up_key
     return up_key, dn_key
 
 
-def _trace_upstream_directed(seed_oids, directed_net, pipe_ups, pipe_dns, infer_direction=True, log_fn=None):
+def _report_trace_edge_gaps(queued, visited, directed_net, endpoint_index, log):
+    """Report unconnected pipe ends sitting just off the edge of the trace.
+
+    The trace stops wherever nothing more flows into a manhole.  When another
+    pipe's end lies a fraction of a foot from that manhole without sharing its
+    key, that is a gap in the data, and everything above it is missing from the
+    map.  Read-only: nothing here changes what the trace collected.
+    """
+    if endpoint_index is None:
+        return
+    gaps = []
+    for key in queued:
+        if not (isinstance(key, tuple) and len(key) == 2):
+            continue  # node-ID keys carry no coordinates
+        if any(oid not in visited for oid, _ in directed_net.get(key, [])):
+            continue  # not an edge of the trace
+        for distance, px, py, oid in _near_points(
+            endpoint_index, GAP_REPORT_RADIUS_FEET, key[0], key[1], GAP_REPORT_RADIUS_FEET
+        ):
+            if distance <= 0 or oid in visited:
+                continue
+            gaps.append((distance, key, oid, (round(px, 4), round(py, 4))))
+            break
+    if not gaps:
+        return
+    gaps.sort(key=lambda item: item[0])
+    log(
+        f"  NOTE: {len(gaps)} edge(s) of this trace have an unconnected pipe end within "
+        f"{GAP_REPORT_RADIUS_FEET:g} ft. Each looks like a gap in the data, and the branch above "
+        "it is missing from this map:"
+    )
+    for distance, key, oid, point in gaps[:MAX_GAP_REPORT_LINES]:
+        log(f"    manhole {key} — OID {oid} ends at {point}, {distance:.4f} ft away")
+    if len(gaps) > MAX_GAP_REPORT_LINES:
+        log(f"    ... and {len(gaps) - MAX_GAP_REPORT_LINES} more")
+    log(
+        "  Raising p4_node_snap_tolerance_feet above those distances would close them "
+        "(it also merges manholes that really are that close, so raise it no further than needed)."
+    )
+
+
+def _trace_upstream_directed(
+    seed_oids, directed_net, pipe_ups, pipe_dns, infer_direction=True, log_fn=None,
+    endpoint_index=None,
+):
     """DFS upstream from the HFML (seed_oids: its segments, longest first).
     Returns (upstream OIDs, the HFML's downstream key).
 
@@ -341,7 +546,9 @@ def _trace_upstream_directed(seed_oids, directed_net, pipe_ups, pipe_dns, infer_
         outflows.setdefault(key, []).append(oid)
 
     seeds = set(seed_oids)
-    up_key, dn_key = _hfml_ends(seed_oids, pipe_ups, pipe_dns, outflows, infer_direction, log)
+    up_key, dn_key = _hfml_ends(
+        seed_oids, pipe_ups, pipe_dns, outflows, infer_direction, log, directed_net=directed_net,
+    )
     blocked = _downstream_keys(dn_key, outflows, pipe_dns, seeds)
     # Every manhole along the HFML except its downstream end: side mains can
     # join an HFML that is split into several segments part-way along.
@@ -382,6 +589,7 @@ def _trace_upstream_directed(seed_oids, directed_net, pipe_ups, pipe_dns, infer_
                     stack.append(pipe_dns[run_oid])
 
     log(f"Upstream trace found {len(to_append)} pipes from the HFML's upstream end {up_key!r}")
+    _report_trace_edge_gaps(queued, visited, directed_net, endpoint_index, log)
     if against_flow:
         log(
             f"  Followed {len(against_flow)} pipe(s) digitized against the flow (they lead only to "
@@ -1016,6 +1224,9 @@ def _setup_phase4_cache(arcpy, config, ml_source, log_fn):
     log_fn(f"Phase 4 cache folder: {cache.dir}")
 
     signature = dataset_signature(arcpy, ml_source)
+    # Part of the fingerprint: a pickled network built at a different tolerance
+    # has different manhole keys and must not be reused.
+    signature["snap_tolerance"] = float(config.get("p4_node_snap_tolerance_feet", 0.1) or 0.0)
     log_fn(f"  ML source fingerprint: {signature}")
     if signature_is_weak(signature):
         log_fn(
@@ -1034,7 +1245,11 @@ def _setup_phase4_cache(arcpy, config, ml_source, log_fn):
     if network is None:
         started = time.time()
         try:
-            network = _build_directed_network(arcpy, effective, None, log_fn)
+            network = _build_directed_network(
+                arcpy, effective, None, log_fn,
+                snap_tolerance=signature["snap_tolerance"],
+                report_gaps=bool(config.get("p4_report_network_gaps", True)),
+            )
         except Exception as exc:
             log_fn(f"  WARNING: whole-extent network build failed — {exc}")
             log_fn("  Falling back to the per-HFML filtered build.")
@@ -1153,6 +1368,21 @@ def run(log_fn):
     run_dir = new_run_dir(config)
     log_fn(f"Run output folder: {run_dir}")
 
+    # The endpoint index is only used to report gaps at the edge of a trace.
+    # Built once per network: with the cache on, every HFML shares one network,
+    # so this is built once per run rather than once per HFML.
+    report_trace_gaps = bool(config.get("p4_report_trace_gaps", True))
+    _endpoint_index_store = {}
+
+    def _endpoint_index_for(geoms_obj):
+        if not report_trace_gaps:
+            return None
+        token = id(geoms_obj)
+        if token not in _endpoint_index_store:
+            _endpoint_index_store.clear()
+            _endpoint_index_store[token] = _endpoint_index(geoms_obj)
+        return _endpoint_index_store[token]
+
     dest_paths = [hfml_layer, ml_dest, ll_dest, parcels_dest]
     _write_phase4_map_manifest([], log_fn)
     hfml_records = []
@@ -1170,6 +1400,7 @@ def run(log_fn):
         else:
             directed_net, geoms, pipe_ups, pipe_dns, use_nodes = _build_directed_network(
                 arcpy, ml_source, start_geom, log_fn,
+                snap_tolerance=float(config.get("p4_node_snap_tolerance_feet", 0.1) or 0.0),
             )
 
         # Use the HFML's own OIDs.  Matching it by endpoint coordinates could pick
@@ -1203,6 +1434,7 @@ def run(log_fn):
 
             upstream_traced, downstream_key = _trace_upstream_directed(
                 seed_oids, directed_net, pipe_ups, pipe_dns, infer_direction=not use_nodes, log_fn=log_fn,
+                endpoint_index=_endpoint_index_for(geoms),
             )
             ml_oids = seed_oids + upstream_traced
             log_fn(f"Traced ML count (incl. seed): {len(ml_oids)}")
