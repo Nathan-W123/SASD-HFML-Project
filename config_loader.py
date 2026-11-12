@@ -58,8 +58,17 @@ OPTIONAL_DEFAULTS = {
     # Rebuild the cache at least this often even if the source looks unchanged.
     # 0 disables the age check.
     "p4_cache_max_age_days": 7,
-    # Copy the ML source to the local cache geodatabase.
+    # Copy sources to the local cache geodatabase.  Every per-HFML spatial
+    # select otherwise re-opens these over the network, which measured at ~35s
+    # (laterals) and ~56s (parcels) per HFML regardless of how much data the
+    # select actually touched -- 51% of Phase 4's runtime.
     "p4_cache_local_ml_copy": True,
+    "p4_cache_local_ll_copy": True,
+    "p4_cache_local_parcels_copy": True,
+    # Skip a local copy unless at least this many GB are free on the cache
+    # disk, and fall back to the remote source.  The parcels layer is
+    # county-wide, so this is what stops the cache filling a small C: drive.
+    "p4_cache_min_free_gb": 20,
     # Ask the ML source only for the assetnums being mapped, instead of reading
     # every row and filtering in Python.
     "p4_filter_assetnum_scan": True,

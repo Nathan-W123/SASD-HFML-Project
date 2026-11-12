@@ -8,7 +8,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 import json
 
 from backend.phase4.network_cache import (
-    Phase4Cache, dataset_signature, default_cache_dir, signature_is_weak,
+    Phase4Cache, dataset_signature, default_cache_dir, free_gb, signature_is_weak,
 )
 from config_loader import load_config
 
@@ -145,6 +145,40 @@ def _require_write_lock(arcpy, path, label):
         )
 
 
+def _describe_sr(arcpy, path):
+    """A short, comparable description of a dataset's coordinate system."""
+    try:
+        sr = arcpy.Describe(path).spatialReference
+        return f"{sr.name} (WKID {sr.factoryCode})"
+    except Exception as exc:
+        return f"unreadable ({exc})"
+
+
+def _report_spatial_references(arcpy, config, log_fn):
+    """Log the coordinate system of each source/destination pair.
+
+    Append reprojects between differing coordinate systems, which moves the
+    geometry slightly.  When a feature is appended and then does not match the
+    map's extent filter, this is the first thing to check.  Read-only.
+    """
+    pairs = (
+        ("ML", "p4_ml_source_path", "p4_ml_dest_path"),
+        ("LL", "p4_ll_source_path", "p4_ll_dest_path"),
+        ("parcels", "p4_parcels_source_path", "p4_parcels_dest_path"),
+    )
+    for label, source_key, dest_key in pairs:
+        source_sr = _describe_sr(arcpy, config[source_key])
+        dest_sr = _describe_sr(arcpy, config[dest_key])
+        if source_sr == dest_sr:
+            log_fn(f"  {label} coordinate system: {source_sr} (source and destination match)")
+        else:
+            log_fn(
+                f"  WARNING: {label} source and destination use different coordinate systems — "
+                f"source {source_sr}, destination {dest_sr}. Append reprojects, which shifts the "
+                "geometry and can push a feature outside the map's extent filter."
+            )
+
+
 def _preflight_phase4(arcpy, config, log_fn):
     dataset_labels = [
         ("ML source", config["p4_ml_source_path"]),
@@ -167,6 +201,7 @@ def _preflight_phase4(arcpy, config, log_fn):
     for label, path in writable_targets:
         _require_write_lock(arcpy, path, label)
     log_fn("Phase 4 destination write locks available")
+    _report_spatial_references(arcpy, config, log_fn)
 
     ml_source_fields = _get_field_names(arcpy, config["p4_ml_source_path"])
     if "OBJECTID" not in ml_source_fields:
@@ -1250,7 +1285,9 @@ def _read_assetnum_segments(arcpy, ml_source, assetnum_set, config, log_fn):
 def _setup_phase4_cache(arcpy, config, ml_source, log_fn):
     """Prepare the local cache.
 
-    Returns (ml_source_to_use, directed_network_or_None).  The network is None
+    Returns (ml_source_to_use, directed_network_or_None, extra_source_overrides).
+    extra_source_overrides maps config keys to local copies of the lateral and
+    parcel sources, for the caller to apply.  The network is None
     when caching is off or unusable, and Phase 4 then builds a spatially
     filtered network per HFML exactly as it used to.
 
@@ -1261,7 +1298,7 @@ def _setup_phase4_cache(arcpy, config, ml_source, log_fn):
     """
     if not config.get("p4_cache_enabled", True):
         log_fn("Phase 4 cache disabled in config.json — building the network per HFML")
-        return ml_source, None
+        return ml_source, None, {}
 
     cache_dir = config.get("p4_cache_dir") or ""
     if cache_dir and not os.path.isabs(cache_dir):
@@ -1269,6 +1306,7 @@ def _setup_phase4_cache(arcpy, config, ml_source, log_fn):
             f"  WARNING: p4_cache_dir must be an absolute local path — ignoring {cache_dir!r}"
         )
         cache_dir = ""
+    extra_sources = {}
     cache = Phase4Cache(
         cache_dir or default_cache_dir(),
         config.get("p4_cache_max_age_days", 7),
@@ -1288,11 +1326,35 @@ def _setup_phase4_cache(arcpy, config, ml_source, log_fn):
             "limit is the backstop."
         )
 
+    min_free_gb = float(config.get("p4_cache_min_free_gb", 20) or 0)
+    available = free_gb(cache.dir)
+    if available is not None:
+        log_fn(f"  Cache disk: {available:.1f} GB free")
+
     effective = ml_source
     if config.get("p4_cache_local_ml_copy", True):
-        local = cache.local_ml_copy(arcpy, ml_source, signature)
+        local = cache.local_ml_copy(arcpy, ml_source, signature, min_free_gb=min_free_gb)
         if local:
             effective = local
+
+    # The lateral and parcel sources are copied the same way.  They carry no
+    # keys across runs, but their object IDs are renumbered by the copy just as
+    # the ML source's are, so whatever this returns has to be used for the
+    # selects, the appends AND the map export (see source_overrides).
+    for config_key, name, label, flag in (
+        ("p4_ll_source_path", "ll_source", "LL", "p4_cache_local_ll_copy"),
+        ("p4_parcels_source_path", "parcels_source", "parcels", "p4_cache_local_parcels_copy"),
+    ):
+        if not config.get(flag, True):
+            continue
+        remote = config[config_key]
+        local = cache.local_copy(
+            arcpy, remote, name, label,
+            dataset_signature(arcpy, remote),
+            min_free_gb=min_free_gb,
+        )
+        if local:
+            extra_sources[config_key] = local
 
     network = cache.load_network(effective, signature)
     if network is None:
@@ -1306,10 +1368,10 @@ def _setup_phase4_cache(arcpy, config, ml_source, log_fn):
         except Exception as exc:
             log_fn(f"  WARNING: whole-extent network build failed — {exc}")
             log_fn("  Falling back to the per-HFML filtered build.")
-            return effective, None
+            return effective, None, extra_sources
         log_fn(f"  Built the directed network in {time.time() - started:.1f}s")
         cache.save_network(effective, signature, network)
-    return effective, network
+    return effective, network, extra_sources
 
 
 def run(log_fn):
@@ -1379,10 +1441,22 @@ def run(log_fn):
     # from one consistent set of object IDs.
     timer = _StepTimer(log_fn)
     ml_source_remote = ml_source
-    with timer.step("cache setup (local ML copy + network)"):
-        ml_source, cached_network = _setup_phase4_cache(arcpy, config, ml_source, log_fn)
+    with timer.step("cache setup (local source copies + network)"):
+        ml_source, cached_network, extra_sources = _setup_phase4_cache(
+            arcpy, config, ml_source, log_fn
+        )
+
+    # Everything from here on -- selects, appends, and the map export -- must
+    # read whichever copy of each source the cache handed back, because a copy
+    # renumbers OBJECTID and this code carries object IDs between those steps.
+    source_overrides = {}
     if ml_source != ml_source_remote:
-        log_fn(f"Using local ML copy for Phase 4: {ml_source}")
+        source_overrides["p4_ml_source_path"] = ml_source
+    source_overrides.update(extra_sources)
+    ll_source = source_overrides.get("p4_ll_source_path", ll_source)
+    parcels_source = source_overrides.get("p4_parcels_source_path", parcels_source)
+    for key, path in sorted(source_overrides.items()):
+        log_fn(f"Using local copy for {key}: {path}")
 
     assetnum_set = set(new_assetnums.values())
     with timer.step("assetnum lookup"):
@@ -1554,12 +1628,12 @@ def run(log_fn):
             record["pdf_path"], record["draft_aprx_path"] = run_output_paths(run_dir, pmnum)
             record["aprx_path"] = aprx_path
             # The map export runs in a separate process that loads config.json
-            # itself.  The object IDs in this record belong to whichever ML
-            # source Phase 4 actually read, so tell it which one that was --
-            # otherwise a local copy's IDs would be looked up in the remote
-            # source and the map would be drawn from the wrong features.
-            if ml_source != ml_source_remote:
-                record["source_overrides"] = {"p4_ml_source_path": ml_source}
+            # itself.  The object IDs in this record belong to whichever copy of
+            # each source Phase 4 actually read, so tell it which ones those
+            # were -- otherwise a local copy's IDs would be looked up in the
+            # remote source and the map would be drawn from the wrong features.
+            if source_overrides:
+                record["source_overrides"] = dict(source_overrides)
             with timer.step("map export (separate process)"):
                 export_hfml_map_out_of_process(record, config, log_fn)
         except Exception as exc:

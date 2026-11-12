@@ -32,7 +32,7 @@ import shutil
 import tempfile
 import time
 
-CACHE_FORMAT_VERSION = 2
+CACHE_FORMAT_VERSION = 3
 LOCAL_GDB_NAME = "hfml_phase4_sources.gdb"
 NETWORK_PICKLE_NAME = "directed_network.pickle"
 STATE_NAME = "cache_state.json"
@@ -93,6 +93,31 @@ def dataset_signature(arcpy, path):
             signature["newest_mtime"] = round(newest, 3)
             signature["total_size"] = total
     return signature
+
+
+def free_gb(path):
+    """Free space in GB on the disk holding `path` (its nearest existing parent)."""
+    probe = os.path.abspath(path)
+    while probe and not os.path.isdir(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            return None
+        probe = parent
+    try:
+        return shutil.disk_usage(probe).free / (1024.0 ** 3)
+    except OSError:
+        return None
+
+
+def _tree_size_gb(path):
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                pass
+    return total / (1024.0 ** 3)
 
 
 def signature_is_weak(signature):
@@ -158,53 +183,94 @@ class Phase4Cache:
         shutil.rmtree(self.dir, ignore_errors=True)
 
     # -- local copy of the ML source ----------------------------------------
-    def local_ml_copy(self, arcpy, ml_source, signature):
-        """Return a local path to a copy of ml_source, reusing it when fresh.
+    def local_copy(self, arcpy, source, name, label, signature, min_free_gb=0):
+        """Return a local path to a copy of `source`, reusing it when fresh.
 
-        Returns None when the copy cannot be made, in which case the caller
-        should carry on using the remote source.
+        `name` is the feature class name inside the local cache geodatabase and
+        the key this copy is tracked under.  Returns None when the copy cannot
+        be made -- no disk space, an unreadable source, a failed copy -- and the
+        caller then carries on against the remote source unchanged.
+
+        Object IDs: a copy renumbers OBJECTID, so whoever takes this path must
+        use it for every step that carries object IDs for this dataset.
         """
+        state_key = f"copy:{name}"
         state = self._read_state()
-        entry = state.get("ml_copy")
-        dest = os.path.join(self.gdb_path, "ml_source")
+        entry = state.get(state_key)
+        dest = os.path.join(self.gdb_path, name)
 
-        if self._entry_is_fresh(entry, ml_source, signature):
+        if self._entry_is_fresh(entry, source, signature):
             try:
                 if arcpy.Exists(dest):
-                    self.log_fn(f"  Reusing local ML copy: {dest}")
+                    self.log_fn(f"  Reusing local {label} copy: {dest}")
                     return dest
             except Exception:
                 pass
 
         os.makedirs(self.dir, exist_ok=True)
+
+        if min_free_gb:
+            available = free_gb(self.dir)
+            if available is None:
+                self.log_fn(
+                    f"  WARNING: could not read free disk space for {self.dir} — "
+                    f"not copying the {label} source locally"
+                )
+                return None
+            if available < min_free_gb:
+                self.log_fn(
+                    f"  Not copying the {label} source locally: {available:.1f} GB free, "
+                    f"{min_free_gb:.1f} GB required (p4_cache_min_free_gb). "
+                    "Continuing against the remote source."
+                )
+                return None
+
         try:
             if not arcpy.Exists(self.gdb_path):
                 arcpy.management.CreateFileGDB(self.dir, LOCAL_GDB_NAME)
             if arcpy.Exists(dest):
                 arcpy.management.Delete(dest)
             started = time.time()
-            self.log_fn(f"  Copying ML source to local disk ({self.dir})...")
-            arcpy.management.CopyFeatures(ml_source, dest)
+            self.log_fn(f"  Copying {label} source to local disk ({self.dir})...")
+            before_gb = _tree_size_gb(self.gdb_path) if os.path.isdir(self.gdb_path) else 0.0
+            arcpy.management.CopyFeatures(source, dest)
             count = int(arcpy.management.GetCount(dest)[0])
+            grew_gb = max(0.0, _tree_size_gb(self.gdb_path) - before_gb)
             self.log_fn(
-                f"  Copied {count} ML features locally in {time.time() - started:.1f}s"
+                f"  Copied {count} {label} features locally in {time.time() - started:.1f}s "
+                f"(+{grew_gb:.2f} GB, {free_gb(self.dir):.1f} GB now free)"
             )
         except Exception as exc:
-            self.log_fn(f"  WARNING: could not copy the ML source locally — {exc}")
-            self.log_fn("  Continuing against the remote ML source.")
+            self.log_fn(f"  WARNING: could not copy the {label} source locally — {exc}")
+            self.log_fn(f"  Continuing against the remote {label} source.")
+            # A half-written copy is worse than none: it would be reused as if
+            # complete on the next run.
+            try:
+                if arcpy.Exists(dest):
+                    arcpy.management.Delete(dest)
+            except Exception:
+                pass
+            state.pop(state_key, None)
+            self._write_state(state)
             return None
 
-        # The copy renumbers OBJECTID, so any pickled network built from the
-        # previous copy no longer matches and must not be reused.
-        state.pop("network", None)
-        state["ml_copy"] = {
-            "source_path": ml_source,
+        if name == "ml_source":
+            # The copy renumbers OBJECTID, so a pickled network built from the
+            # previous copy no longer matches and must not be reused.
+            state.pop("network", None)
+        state[state_key] = {
+            "source_path": source,
             "signature": signature,
             "written_at": time.time(),
             "local_path": dest,
         }
         self._write_state(state)
         return dest
+
+    def local_ml_copy(self, arcpy, ml_source, signature, min_free_gb=0):
+        return self.local_copy(
+            arcpy, ml_source, "ml_source", "ML", signature, min_free_gb=min_free_gb
+        )
 
     # -- directed network ----------------------------------------------------
     def load_network(self, network_source, signature):

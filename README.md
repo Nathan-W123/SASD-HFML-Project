@@ -73,6 +73,9 @@ to `config.json` — these keys are optional and default to on:
 | `p4_cache_dir` | `""` | absolute local path; empty means `%LOCALAPPDATA%\SASD_HFML\phase4_cache` |
 | `p4_cache_max_age_days` | `7` | rebuild this often even if the source looks unchanged; `0` disables |
 | `p4_cache_local_ml_copy` | `true` | copy the ML source to local disk |
+| `p4_cache_local_ll_copy` | `true` | copy the lateral source to local disk |
+| `p4_cache_local_parcels_copy` | `true` | copy the parcel source to local disk |
+| `p4_cache_min_free_gb` | `20` | skip a local copy (and use the remote source) below this much free space |
 | `p4_filter_assetnum_scan` | `true` | filter the assetnum lookup in the query |
 | `p4_node_snap_tolerance_feet` | `0.1` | pipe ends this far apart count as one manhole; `0` restores exact matching |
 | `p4_report_network_gaps` | `true` | log how close manholes sit without sharing a key (read-only) |
@@ -102,12 +105,27 @@ import, observations query, building and exporting the map). The difference
 between Phase 4's figure for that step and those three is the cost of starting
 a Python interpreter and importing the module — paid once per HFML.
 
-Note what the caching did and did not buy. Copying the ML source locally and
-building the network take about 18 seconds between them, so eliminating four
-rebuilds per run saves under a minute. The remaining time is in the per-HFML
-work: the lateral and parcel sources are still read over the network, every
-append and the finished PDF are written to the share, and a fresh interpreter
-starts for each map. Read the timings before optimising any of it.
+A measured run (2026-11-12, five HFMLs, 884s of Phase 4) broke down as:
+
+```
+map export (separate process):  342.2s (39%)
+select parcels (remote):        278.3s (31%)
+select LLs (remote):            171.9s (19%)
+appends:                         85.0s (10%)
+everything else:                  6.5s  (1%)
+```
+
+The selects were flat with respect to data volume — 4 laterals took as long as
+226 — so that cost was opening the remote geodatabases, paid once per HFML, not
+the spatial work. Hence the lateral and parcel sources are now copied locally
+alongside the mainlines.
+
+Interpreter startup turned out to be negligible: of 68s per export, 5.5s was
+importing arcpy and 61s was building and exporting the map, leaving about 2s of
+process startup. Replacing the per-HFML subprocess would save ~27s a run.
+
+Read the timings before optimising anything else; the first round of caching was
+aimed at what turned out to be 18 seconds of an 18-minute run.
 
 ## Why a branch of mainlines goes missing
 

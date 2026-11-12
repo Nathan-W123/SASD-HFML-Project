@@ -931,6 +931,11 @@ def export_hfml_map(arcpy, hfml, config, today, observations_map, log_fn):
         map_obj.referenceScale = 0  # disable scale-dependent symbol sizing
         _apply_camera_extent(arcpy, map_frame, extent, log_fn)
         camera_extent = map_frame.camera.getExtent()
+        try:
+            map_sr = map_obj.spatialReference
+            log_fn(f"  Map coordinate system: {map_sr.name} (WKID {map_sr.factoryCode})")
+        except Exception:
+            pass
         _scope_layers(arcpy, map_obj, hfml_id, camera_extent, log_fn)
         _log_layer_report(arcpy, map_obj, hfml_id, config, log_fn, hfml=hfml)
         _report_offscreen_features(arcpy, hfml, config, camera_extent, log_fn)
