@@ -6,6 +6,7 @@ import json
 import re
 import shutil
 import subprocess
+import time
 import traceback
 from datetime import date, datetime
 
@@ -1031,11 +1032,17 @@ def export_hfml_map_out_of_process(hfml, config, log_fn):
 
 def _run_export_job():
     # Entry point for the standalone export process started above.
+    #
+    # Timed in three parts.  Phase 4 measures this process's whole wall time,
+    # so the part it reports minus these three is the cost of starting a Python
+    # interpreter and importing this module -- which is paid once per HFML.
     log_fn = lambda msg: print(msg, flush=True)
     try:
         with open(EXPORT_JOB_PATH, "r") as f:
             hfml = json.load(f)
+        started = time.perf_counter()
         arcpy = _import_arcpy()
+        log_fn(f"  export process: arcpy import {time.perf_counter() - started:.1f}s")
         config = load_config()
         # Phase 4 may have read a local copy of a source instead of the path in
         # config.json.  The object IDs in this job belong to that copy, so use
@@ -1047,8 +1054,12 @@ def _run_export_job():
                 log_fn(f"Using Phase 4 source override: {key} -> {value}")
             config[key] = value
         hfml_id = str(hfml["pmnum"])
+        started = time.perf_counter()
         observations_map = fetch_observations([hfml_id], config, log_fn)
+        log_fn(f"  export process: observations query {time.perf_counter() - started:.1f}s")
+        started = time.perf_counter()
         export_hfml_map(arcpy, hfml, config, export_today(), observations_map, log_fn)
+        log_fn(f"  export process: build and export map {time.perf_counter() - started:.1f}s")
     except Exception:
         log_fn(traceback.format_exc())
         raise SystemExit(1)

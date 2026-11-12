@@ -86,6 +86,29 @@ buffer traces identically; one with a longer run now traces to its real end,
 which is the correct result but a change from previous months. Compare a few
 PDFs against last month's before trusting a batch.
 
+## Finding out where Phase 4 spends its time
+
+Phase 4 logs how long each step takes, per HFML and summed for the run:
+
+```
+  Timing for 9895 — 142.3s total: map export (separate process) 96.1s, select parcels ...
+Phase 4 time by step (714.8s across all HFMLs):
+    map export (separate process): 480.5s (67%)
+    ...
+```
+
+The export runs in its own process, which logs its own three parts (arcpy
+import, observations query, building and exporting the map). The difference
+between Phase 4's figure for that step and those three is the cost of starting
+a Python interpreter and importing the module — paid once per HFML.
+
+Note what the caching did and did not buy. Copying the ML source locally and
+building the network take about 18 seconds between them, so eliminating four
+rebuilds per run saves under a minute. The remaining time is in the per-HFML
+work: the lateral and parcel sources are still read over the network, every
+append and the finished PDF are written to the share, and a fresh interpreter
+starts for each map. Read the timings before optimising any of it.
+
 ## Why a branch of mainlines goes missing
 
 The trace matches manholes by exact key. Sewer data is rarely snapped to the

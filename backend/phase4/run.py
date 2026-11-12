@@ -2,6 +2,7 @@ import math
 import os
 import sys
 import time
+from contextlib import contextmanager
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import json
@@ -176,6 +177,55 @@ def _preflight_phase4(arcpy, config, log_fn):
     log_fn(f"LL destination field count: {len(_get_field_names(arcpy, config['p4_ll_dest_path']))}")
     log_fn(f"Parcels source field count: {len(_get_field_names(arcpy, config['p4_parcels_source_path']))}")
     log_fn(f"Parcels destination field count: {len(_get_field_names(arcpy, config['p4_parcels_dest_path']))}")
+
+
+class _StepTimer:
+    """Times each step of Phase 4, per HFML and across the run.
+
+    Phase 4 spends minutes per HFML and the log never said where, so a guess
+    about what to optimise was only ever a guess.  Read-only: nothing here
+    changes what the pipeline does.
+    """
+
+    def __init__(self, log_fn):
+        self.log_fn = log_fn
+        self.run_totals = {}
+        self.order = []
+        self.current = {}
+
+    @contextmanager
+    def step(self, label):
+        started = time.perf_counter()
+        try:
+            yield
+        finally:
+            elapsed = time.perf_counter() - started
+            self.current[label] = self.current.get(label, 0.0) + elapsed
+            self.run_totals[label] = self.run_totals.get(label, 0.0) + elapsed
+            if label not in self.order:
+                self.order.append(label)
+
+    def start_hfml(self):
+        self.current = {}
+
+    def log_hfml(self, pmnum):
+        if not self.current:
+            return
+        total = sum(self.current.values())
+        parts = ", ".join(
+            f"{label} {seconds:.1f}s"
+            for label, seconds in sorted(self.current.items(), key=lambda kv: -kv[1])
+        )
+        self.log_fn(f"  Timing for {pmnum} — {total:.1f}s total: {parts}")
+
+    def log_run(self):
+        if not self.run_totals:
+            return
+        total = sum(self.run_totals.values())
+        self.log_fn(f"Phase 4 time by step ({total:.1f}s across all HFMLs):")
+        for label, seconds in sorted(self.run_totals.items(), key=lambda kv: -kv[1]):
+            share = (seconds / total * 100) if total else 0
+            self.log_fn(f"    {label}: {seconds:.1f}s ({share:.0f}%)")
 
 
 class _NodeSnapper:
@@ -1327,15 +1377,18 @@ def run(log_fn):
     # the remote source changes.  ml_source becomes the local copy when one was
     # made, so everything below -- tracing, appends, and the map export -- works
     # from one consistent set of object IDs.
+    timer = _StepTimer(log_fn)
     ml_source_remote = ml_source
-    ml_source, cached_network = _setup_phase4_cache(arcpy, config, ml_source, log_fn)
+    with timer.step("cache setup (local ML copy + network)"):
+        ml_source, cached_network = _setup_phase4_cache(arcpy, config, ml_source, log_fn)
     if ml_source != ml_source_remote:
         log_fn(f"Using local ML copy for Phase 4: {ml_source}")
 
     assetnum_set = set(new_assetnums.values())
-    assetnum_segments = _read_assetnum_segments(
-        arcpy, ml_source, assetnum_set, config, log_fn
-    )
+    with timer.step("assetnum lookup"):
+        assetnum_segments = _read_assetnum_segments(
+            arcpy, ml_source, assetnum_set, config, log_fn
+        )
 
     log_fn(f"Matched {len(assetnum_segments)}/{len(assetnum_set)} assetnums to geometry in ML source")
 
@@ -1397,6 +1450,7 @@ def run(log_fn):
         pmnum = hfml["pmnum"]
         start_geom = hfml["geom"]
         log_fn(f"--- HFML {i}/{len(new_hfmls)}: pmnum {pmnum} ---")
+        timer.start_hfml()
 
         if cached_network is not None:
             directed_net, geoms, pipe_ups, pipe_dns, use_nodes = cached_network
@@ -1431,21 +1485,25 @@ def run(log_fn):
 
         # Snapshot destination OIDs so everything appended for this HFML can be
         # removed once its map is exported (or if anything fails midway).
-        snapshot = _snapshot_destinations(arcpy, dest_paths)
+        with timer.step("snapshot destinations"):
+            snapshot = _snapshot_destinations(arcpy, dest_paths)
         try:
-            _append_seed_to_hfml_layer(arcpy, seed_oids, ml_source, config["p4_ml_layer_path"], pmnum, pm_mainlines_path, log_fn)
+            with timer.step("append seed to HFML layer"):
+                _append_seed_to_hfml_layer(arcpy, seed_oids, ml_source, config["p4_ml_layer_path"], pmnum, pm_mainlines_path, log_fn)
 
-            upstream_traced, downstream_key = _trace_upstream_directed(
-                seed_oids, directed_net, pipe_ups, pipe_dns, infer_direction=not use_nodes, log_fn=log_fn,
-                endpoint_index=_endpoint_index_for(geoms),
-            )
+            with timer.step("upstream trace"):
+                upstream_traced, downstream_key = _trace_upstream_directed(
+                    seed_oids, directed_net, pipe_ups, pipe_dns, infer_direction=not use_nodes, log_fn=log_fn,
+                    endpoint_index=_endpoint_index_for(geoms),
+                )
             ml_oids = seed_oids + upstream_traced
             log_fn(f"Traced ML count (incl. seed): {len(ml_oids)}")
             log_fn(f"Traced ML OID preview: {_preview_oids(ml_oids)}")
             # Exclude the seed from the upstream ML trace layer — it belongs only
             # in the HFML layer (already written above via _append_seed_to_hfml_layer).
             upstream_ml_oids = list(upstream_traced)
-            _append_by_oids(arcpy, upstream_ml_oids, ml_source, ml_dest)
+            with timer.step("append upstream MLs"):
+                _append_by_oids(arcpy, upstream_ml_oids, ml_source, ml_dest)
             log_fn(f"Appended {len(upstream_ml_oids)} upstream ML segments (seed excluded)")
 
             # LLs are found from the HFML and its upstream MLs only (ml_oids).
@@ -1458,22 +1516,26 @@ def run(log_fn):
                 downstream_point = (geoms[bottom][2], geoms[bottom][3])
             else:
                 downstream_point = downstream_key
-            ll_oids = _select_lls_contacting_mls(
-                arcpy, ml_oids, ml_source, ll_source,
-                downstream_point=downstream_point, log_fn=log_fn,
-            )
+            with timer.step("select LLs (remote LL source)"):
+                ll_oids = _select_lls_contacting_mls(
+                    arcpy, ml_oids, ml_source, ll_source,
+                    downstream_point=downstream_point, log_fn=log_fn,
+                )
             log_fn(f"Selected LL count: {len(ll_oids)}")
             log_fn(f"Selected LL OID preview: {_preview_oids(ll_oids)}")
-            _append_by_oids(arcpy, ll_oids, ll_source, ll_dest)
+            with timer.step("append LLs"):
+                _append_by_oids(arcpy, ll_oids, ll_source, ll_dest)
             log_fn(f"Appended {len(ll_oids)} LLs")
 
-            parcel_oids = _select_parcels_intersecting_lls(
-                arcpy, ll_oids, ll_source, parcels_source,
-                ml_oid_list=ml_oids, ml_source=ml_source, log_fn=log_fn,
-            )
+            with timer.step("select parcels (remote parcels source)"):
+                parcel_oids = _select_parcels_intersecting_lls(
+                    arcpy, ll_oids, ll_source, parcels_source,
+                    ml_oid_list=ml_oids, ml_source=ml_source, log_fn=log_fn,
+                )
             log_fn(f"Selected parcel count: {len(parcel_oids)}")
             log_fn(f"Selected parcel OID preview: {_preview_oids(parcel_oids)}")
-            _append_by_oids(arcpy, parcel_oids, parcels_source, parcels_dest)
+            with timer.step("append parcels"):
+                _append_by_oids(arcpy, parcel_oids, parcels_source, parcels_dest)
             log_fn(f"Appended {len(parcel_oids)} parcels")
 
             record = {
@@ -1498,19 +1560,24 @@ def run(log_fn):
             # source and the map would be drawn from the wrong features.
             if ml_source != ml_source_remote:
                 record["source_overrides"] = {"p4_ml_source_path": ml_source}
-            export_hfml_map_out_of_process(record, config, log_fn)
+            with timer.step("map export (separate process)"):
+                export_hfml_map_out_of_process(record, config, log_fn)
         except Exception as exc:
             log_fn(f"  ERROR: HFML {pmnum} failed — {exc}")
             failed.append(pmnum)
             continue
         finally:
-            _cleanup_destinations(arcpy, snapshot, log_fn)
+            with timer.step("cleanup appended rows"):
+                _cleanup_destinations(arcpy, snapshot, log_fn)
+            timer.log_hfml(pmnum)
 
         hfml_records.append(record)
         # Write manifest after every HFML so Phase 5 can verify at any point,
         # even if Phase 4 is stopped midway.
         _write_phase4_map_manifest(hfml_records, log_fn)
         log_fn(f"HFML {pmnum} complete — map saved, appended features removed")
+
+    timer.log_run()
 
     if failed:
         raise RuntimeError(
