@@ -39,12 +39,19 @@ STATE_NAME = "cache_state.json"
 
 
 def default_cache_dir():
-    """A local scratch directory.
+    """A local directory that survives between ArcGIS Pro sessions.
 
-    Deliberately NOT under the project folder: for shared users the project
-    itself lives on the network share, so caching there would cache onto the
-    very disk we are trying to avoid.
+    NOT tempfile.gettempdir(): inside ArcGIS Pro that resolves to a per-session
+    folder (...\\Temp\\2\\ArcGISProTempNNNNN), so the cache would be thrown away
+    every time Pro restarts and every run would rebuild from scratch.
+
+    NOT the project folder either: for shared users the project itself lives on
+    the network share, so caching there would cache onto the very disk we are
+    trying to avoid.
     """
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    if os.path.isdir(base):
+        return os.path.join(base, "SASD_HFML", "phase4_cache")
     return os.path.join(tempfile.gettempdir(), "hfml_phase4_cache")
 
 

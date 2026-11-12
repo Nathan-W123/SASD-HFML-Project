@@ -70,7 +70,7 @@ to `config.json` — these keys are optional and default to on:
 | key | default | what it does |
 | --- | --- | --- |
 | `p4_cache_enabled` | `true` | `false` restores the old per-HFML build |
-| `p4_cache_dir` | `""` | absolute local path; empty means system temp |
+| `p4_cache_dir` | `""` | absolute local path; empty means `%LOCALAPPDATA%\SASD_HFML\phase4_cache` |
 | `p4_cache_max_age_days` | `7` | rebuild this often even if the source looks unchanged; `0` disables |
 | `p4_cache_local_ml_copy` | `true` | copy the ML source to local disk |
 | `p4_filter_assetnum_scan` | `true` | filter the assetnum lookup in the query |
