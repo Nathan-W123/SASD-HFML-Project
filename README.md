@@ -116,9 +116,13 @@ everything else:                  6.5s  (1%)
 ```
 
 The selects were flat with respect to data volume — 4 laterals took as long as
-226 — so that cost was opening the remote geodatabases, paid once per HFML, not
-the spatial work. Hence the lateral and parcel sources are now copied locally
-alongside the mainlines.
+226. Copying those sources to local disk barely moved them, and instrumenting
+inside the two functions showed why: the spatial selects over the whole lateral
+and parcel layers cost **0.7s and 0.5s across the entire run**. The time was in
+building scratch feature classes for the lateral endpoints — ~17–20s per call,
+twice per HFML, whatever the data volume — plus deleting them again. That is
+fixed geoprocessing overhead against the legacy `in_memory` workspace, so the
+scratch workspace is now the modern `memory`, with `in_memory` as a fallback.
 
 Interpreter startup turned out to be negligible: of 68s per export, 5.5s was
 importing arcpy and 61s was building and exporting the map, leaving about 2s of

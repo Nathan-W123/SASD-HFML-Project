@@ -107,11 +107,44 @@ def _norm_id(value):
     return str(int(number)) if number.is_integer() else text
 
 
+_SCRATCH_WORKSPACE = {}
+
+
+def _scratch_workspace(arcpy, log_fn=None):
+    """Which in-memory workspace scratch feature classes go in.
+
+    'memory' is the modern workspace and is markedly faster than the legacy
+    'in_memory' for the create / add-field / delete cycle this code runs twice
+    per HFML -- which measured at ~17s per call regardless of how many features
+    were involved, i.e. fixed tool overhead rather than data work.
+
+    Probed once per process, falling back to 'in_memory' so an environment
+    without it still works.
+    """
+    if "name" not in _SCRATCH_WORKSPACE:
+        name = "in_memory"
+        try:
+            probe = "memory\\_hfml_probe"
+            if arcpy.Exists(probe):
+                arcpy.management.Delete(probe)
+            arcpy.management.CreateFeatureclass("memory", "_hfml_probe", "POINT")
+            arcpy.management.Delete(probe)
+            name = "memory"
+        except Exception as exc:
+            if log_fn:
+                log_fn(f"  Scratch workspace 'memory' unavailable ({exc}) — using 'in_memory'")
+        _SCRATCH_WORKSPACE["name"] = name
+        if log_fn:
+            log_fn(f"  Scratch workspace: {name}")
+    return _SCRATCH_WORKSPACE["name"]
+
+
 def _geom_to_temp_fc(arcpy, geom, name):
-    path = f"in_memory\\{name}"
+    workspace = _scratch_workspace(arcpy)
+    path = f"{workspace}\\{name}"
     if arcpy.Exists(path):
         arcpy.management.Delete(path)
-    arcpy.management.CreateFeatureclass("in_memory", name, "POLYLINE", spatial_reference=geom.spatialReference)
+    arcpy.management.CreateFeatureclass(workspace, name, "POLYLINE", spatial_reference=geom.spatialReference)
     with arcpy.da.InsertCursor(path, ["SHAPE@"]) as cursor:
         cursor.insertRow([geom])
     return path
@@ -201,6 +234,7 @@ def _preflight_phase4(arcpy, config, log_fn):
     for label, path in writable_targets:
         _require_write_lock(arcpy, path, label)
     log_fn("Phase 4 destination write locks available")
+    _scratch_workspace(arcpy, log_fn)
     _report_spatial_references(arcpy, config, log_fn)
     # A select-by-location scans the whole layer however few features it picks,
     # so these counts set the floor on what each per-HFML select can cost.
@@ -819,19 +853,25 @@ def _write_phase4_map_manifest(hfml_records, log_fn):
     log_fn(f"Phase 4 map manifest written: {PHASE4_MAP_OUTPUT_PATH}")
 
 
-def _build_ll_endpoint_table(arcpy, ll_layer, output_name="_TmpLLEndpoints"):
-    output_path = f"in_memory\\{output_name}"
-    if arcpy.Exists(output_path):
-        arcpy.management.Delete(output_path)
+def _build_ll_endpoint_table(arcpy, ll_layer, output_name="_TmpLLEndpoints", timer=None):
+    timer = timer or _NullTimer()
+    workspace = _scratch_workspace(arcpy)
+    output_path = f"{workspace}\\{output_name}"
 
-    ll_desc = arcpy.Describe(ll_layer)
-    spatial_ref = ll_desc.spatialReference
-    arcpy.management.CreateFeatureclass("in_memory", output_name, "POINT", spatial_reference=spatial_ref)
-    arcpy.management.AddField(output_path, "LL_OID", "LONG")
-    arcpy.management.AddField(output_path, "END_ID", "LONG")
+    with timer.substep("endpoint table: describe source"):
+        if arcpy.Exists(output_path):
+            arcpy.management.Delete(output_path)
+        ll_desc = arcpy.Describe(ll_layer)
+        spatial_ref = ll_desc.spatialReference
+
+    with timer.substep("endpoint table: create and add fields"):
+        arcpy.management.CreateFeatureclass(workspace, output_name, "POINT", spatial_reference=spatial_ref)
+        arcpy.management.AddField(output_path, "LL_OID", "LONG")
+        arcpy.management.AddField(output_path, "END_ID", "LONG")
 
     end_id = 1
-    with arcpy.da.InsertCursor(output_path, ["SHAPE@", "LL_OID", "END_ID"]) as insert_cursor:
+    with timer.substep("endpoint table: insert rows"), \
+            arcpy.da.InsertCursor(output_path, ["SHAPE@", "LL_OID", "END_ID"]) as insert_cursor:
         with arcpy.da.SearchCursor(ll_layer, ["OBJECTID", "SHAPE@"]) as search_cursor:
             for ll_oid, geom in search_cursor:
                 if geom is None:
@@ -900,7 +940,7 @@ def _select_lls_contacting_mls(
                 log_fn(f"Candidate LL count before endpoint filter: {_get_count(arcpy, candidate_ll_layer)}")
 
         with timer.substep("LL: build endpoint table"):
-            endpoint_fc = _build_ll_endpoint_table(arcpy, candidate_ll_layer)
+            endpoint_fc = _build_ll_endpoint_table(arcpy, candidate_ll_layer, timer=timer)
             endpoint_layer = _replace_temp_layer(arcpy, "_TmpLLEndpointLayer", endpoint_fc)
             arcpy.management.SelectLayerByAttribute(endpoint_layer, "CLEAR_SELECTION")
 
@@ -948,31 +988,37 @@ def _select_lls_contacting_mls(
 
         return sorted(hits)
     finally:
-        if ml_layer is not None and arcpy.Exists(ml_layer):
-            arcpy.management.Delete(ml_layer)
-        if arcpy.Exists(ll_layer):
-            arcpy.management.Delete(ll_layer)
-        if candidate_ll_layer is not None and arcpy.Exists(candidate_ll_layer):
-            arcpy.management.Delete(candidate_ll_layer)
-        if endpoint_layer is not None and arcpy.Exists(endpoint_layer):
-            arcpy.management.Delete(endpoint_layer)
-        if endpoint_fc is not None and arcpy.Exists(endpoint_fc):
-            arcpy.management.Delete(endpoint_fc)
+        with timer.substep("LL: delete scratch layers"):
+            if ml_layer is not None and arcpy.Exists(ml_layer):
+                arcpy.management.Delete(ml_layer)
+            if arcpy.Exists(ll_layer):
+                arcpy.management.Delete(ll_layer)
+            if candidate_ll_layer is not None and arcpy.Exists(candidate_ll_layer):
+                arcpy.management.Delete(candidate_ll_layer)
+            if endpoint_layer is not None and arcpy.Exists(endpoint_layer):
+                arcpy.management.Delete(endpoint_layer)
+            if endpoint_fc is not None and arcpy.Exists(endpoint_fc):
+                arcpy.management.Delete(endpoint_fc)
 
 
 
 
-def _copy_endpoint_subset(arcpy, source_layer, endpoint_ids, output_name="_TmpParcelSideEndpoints"):
-    output_path = f"in_memory\\{output_name}"
-    if arcpy.Exists(output_path):
-        arcpy.management.Delete(output_path)
+def _copy_endpoint_subset(arcpy, source_layer, endpoint_ids, output_name="_TmpParcelSideEndpoints",
+                         timer=None):
+    timer = timer or _NullTimer()
+    workspace = _scratch_workspace(arcpy)
+    output_path = f"{workspace}\\{output_name}"
 
-    source_desc = arcpy.Describe(source_layer)
-    spatial_ref = source_desc.spatialReference
-    arcpy.management.CreateFeatureclass("in_memory", output_name, "POINT", spatial_reference=spatial_ref)
+    with timer.substep("endpoint subset: create"):
+        if arcpy.Exists(output_path):
+            arcpy.management.Delete(output_path)
+        source_desc = arcpy.Describe(source_layer)
+        spatial_ref = source_desc.spatialReference
+        arcpy.management.CreateFeatureclass(workspace, output_name, "POINT", spatial_reference=spatial_ref)
 
     endpoint_id_set = set(endpoint_ids)
-    with arcpy.da.InsertCursor(output_path, ["SHAPE@"]) as insert_cursor:
+    with timer.substep("endpoint subset: insert rows"), \
+            arcpy.da.InsertCursor(output_path, ["SHAPE@"]) as insert_cursor:
         with arcpy.da.SearchCursor(source_layer, ["SHAPE@", "END_ID"]) as search_cursor:
             for geom, end_id in search_cursor:
                 if end_id in endpoint_id_set:
@@ -1006,7 +1052,9 @@ def _select_parcels_intersecting_lls(
     parcel_endpoint_layer = None
     try:
         with timer.substep("parcels: build LL endpoint table"):
-            endpoint_fc = _build_ll_endpoint_table(arcpy, ll_layer, "_TmpParcelLLEndpoints")
+            endpoint_fc = _build_ll_endpoint_table(
+                arcpy, ll_layer, "_TmpParcelLLEndpoints", timer=timer
+            )
             endpoint_layer = _replace_temp_layer(arcpy, "_TmpParcelLLEndpointLayer", endpoint_fc)
 
         # Build per-LL endpoint mapping before any selection is active.
@@ -1069,7 +1117,9 @@ def _select_parcels_intersecting_lls(
 
         with timer.substep("parcels: parcel-side endpoint subset"):
             arcpy.management.SelectLayerByAttribute(endpoint_layer, "CLEAR_SELECTION")
-            parcel_endpoint_fc = _copy_endpoint_subset(arcpy, endpoint_layer, parcel_endpoint_ids)
+            parcel_endpoint_fc = _copy_endpoint_subset(
+                arcpy, endpoint_layer, parcel_endpoint_ids, timer=timer
+            )
             parcel_endpoint_layer = _replace_temp_layer(
                 arcpy,
                 "_TmpParcelSideEndpointLayer",
@@ -1117,20 +1167,21 @@ def _select_parcels_intersecting_lls(
             log_fn(f"  {unmatched} LL end(s) have no parcel within {tol:g} ft")
         return sorted(chosen)
     finally:
-        if ml_layer is not None and arcpy.Exists(ml_layer):
-            arcpy.management.Delete(ml_layer)
-        if arcpy.Exists(ll_layer):
-            arcpy.management.Delete(ll_layer)
-        if arcpy.Exists(parcels_layer):
-            arcpy.management.Delete(parcels_layer)
-        if endpoint_layer is not None and arcpy.Exists(endpoint_layer):
-            arcpy.management.Delete(endpoint_layer)
-        if endpoint_fc is not None and arcpy.Exists(endpoint_fc):
-            arcpy.management.Delete(endpoint_fc)
-        if parcel_endpoint_layer is not None and arcpy.Exists(parcel_endpoint_layer):
-            arcpy.management.Delete(parcel_endpoint_layer)
-        if parcel_endpoint_fc is not None and arcpy.Exists(parcel_endpoint_fc):
-            arcpy.management.Delete(parcel_endpoint_fc)
+        with timer.substep("parcels: delete scratch layers"):
+            if ml_layer is not None and arcpy.Exists(ml_layer):
+                arcpy.management.Delete(ml_layer)
+            if arcpy.Exists(ll_layer):
+                arcpy.management.Delete(ll_layer)
+            if arcpy.Exists(parcels_layer):
+                arcpy.management.Delete(parcels_layer)
+            if endpoint_layer is not None and arcpy.Exists(endpoint_layer):
+                arcpy.management.Delete(endpoint_layer)
+            if endpoint_fc is not None and arcpy.Exists(endpoint_fc):
+                arcpy.management.Delete(endpoint_fc)
+            if parcel_endpoint_layer is not None and arcpy.Exists(parcel_endpoint_layer):
+                arcpy.management.Delete(parcel_endpoint_layer)
+            if parcel_endpoint_fc is not None and arcpy.Exists(parcel_endpoint_fc):
+                arcpy.management.Delete(parcel_endpoint_fc)
 
 
 def _append_seed_to_hfml_layer(arcpy, seed_oids, ml_source, hfml_layer, pmnum, pm_mainlines_path, log_fn):
