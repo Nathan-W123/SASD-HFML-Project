@@ -620,7 +620,7 @@ def _build_directed_network(arcpy, ml_source, start_geom, log_fn, snap_tolerance
     return directed_net, geoms, pipe_ups, pipe_dns, use_nodes
 
 
-def _against_flow_run(start_oid, outflows, pipe_dns, visited, stop_keys, blocked_keys):
+def _against_flow_run(start_oid, outflows, pipe_dns, visited, stop_keys, blocked_keys, allowed=None):
     """start_oid is digitized away from a traced manhole, which already drains
     through the pipe the trace climbed.  A gravity main can't end in nothing,
     so if everything digitized onward from start_oid dead-ends (or runs back
@@ -640,6 +640,8 @@ def _against_flow_run(start_oid, outflows, pipe_dns, visited, stop_keys, blocked
         for oid in outflows.get(key, []):
             if oid in visited or oid in run:
                 continue
+            if allowed is not None and oid not in allowed:
+                continue  # a main outside the status filter is not part of the network
             run.append(oid)
             if len(run) > MAX_AGAINST_FLOW_RUN:
                 return None
@@ -750,7 +752,7 @@ def _report_trace_edge_gaps(queued, visited, directed_net, endpoint_index, log):
 
 def _trace_upstream_directed(
     seed_oids, directed_net, pipe_ups, pipe_dns, infer_direction=True, log_fn=None,
-    endpoint_index=None,
+    endpoint_index=None, allowed=None,
 ):
     """DFS upstream from the HFML (seed_oids: its segments, longest first).
     Returns (upstream OIDs, the HFML's downstream key).
@@ -762,6 +764,11 @@ def _trace_upstream_directed(
 
     Every map is cleaned up after export, so pipes already present in the
     destination (e.g. from older runs) are traced through like any other.
+
+    allowed, when given, is the set of mains the trace may use (the main status
+    filter).  A main outside it is treated as absent: not mapped, not followed,
+    so nothing reached only through it is mapped either.  The HFML's own
+    segments are always mapped, whatever their status.
     """
     log = log_fn or (lambda msg: None)
     outflows = {}
@@ -783,12 +790,16 @@ def _trace_upstream_directed(
     confirmed = any(oid not in seeds for oid in outflows.get(dn_key, []))
 
     visited = set(seeds)
-    to_append, against_flow, looped = [], [], []
+    to_append, against_flow, looped, stopped = [], [], [], []
     stack, queued = list(start_keys), set(start_keys)
     while stack:
         key = stack.pop()
         for oid, from_key in directed_net.get(key, []):
             if oid in visited:
+                continue
+            if allowed is not None and oid not in allowed:
+                visited.add(oid)
+                stopped.append(oid)
                 continue
             if from_key in blocked:
                 looped.append(oid)
@@ -803,7 +814,12 @@ def _trace_upstream_directed(
         for oid in outflows.get(key, []):
             if oid in visited:
                 continue
-            for run_oid in _against_flow_run(oid, outflows, pipe_dns, visited, queued, blocked) or []:
+            if allowed is not None and oid not in allowed:
+                visited.add(oid)
+                continue
+            for run_oid in _against_flow_run(
+                oid, outflows, pipe_dns, visited, queued, blocked, allowed=allowed,
+            ) or []:
                 visited.add(run_oid)
                 to_append.append(run_oid)
                 against_flow.append(run_oid)
@@ -812,6 +828,11 @@ def _trace_upstream_directed(
                     stack.append(pipe_dns[run_oid])
 
     log(f"Upstream trace found {len(to_append)} pipes from the HFML's upstream end {up_key!r}")
+    if stopped:
+        log(
+            f"  Stopped at {len(stopped)} main(s) outside the main status filter — not mapped, "
+            f"and nothing upstream of them is: {_preview_oids(sorted(stopped))}"
+        )
     _report_trace_edge_gaps(queued, visited, directed_net, endpoint_index, log)
     if against_flow:
         log(
@@ -1161,33 +1182,64 @@ def _layer_pool(arcpy):
         pool.close()
 
 
-def _check_status_filter(arcpy, ll_source, status_filter, log_fn):
-    """Return the lateral status filter if it is usable, else None.
+def _clear_leftover_trace_rows(arcpy, paths, log_fn):
+    """Delete rows already in the trace destination tables before mapping.
 
-    Tried once against the lateral source before any HFML.  A filter that is
-    invalid -- a renamed field, a typo -- or that matches no lateral at all
-    would silently empty every map, so either case switches it off and says so.
+    Each map's rows are removed after it is exported, so at the start of a run
+    these tables should be empty.  Anything there was left by a run that did
+    not finish cleaning up, and it is drawn on every later map that covers its
+    area -- HFML 10774 drew four such mains and thirteen laterals on
+    2026-11-17.  The HFML layer (PMs_SSGRAVITYMAIN) is deliberately not passed
+    in: a seed left there marks its HFML as already mapped.
+
+    Assumes one pipeline run at a time, as the per-map cleanup already does.
+    """
+    for path in paths:
+        def _delete(path=path):
+            removed = []
+            with arcpy.da.UpdateCursor(path, ["OID@"]) as cursor:
+                for (oid,) in cursor:
+                    cursor.deleteRow()
+                    removed.append(oid)
+            return removed
+
+        removed = _with_arcpy_retry(arcpy, _delete, f"Failed to remove leftover rows from {path}")
+        if removed:
+            log_fn(
+                f"Removed {len(removed)} leftover row(s) from an earlier run in {path}: "
+                f"{_preview_oids(sorted(removed))}"
+            )
+
+
+def _check_status_filter(arcpy, source, status_filter, log_fn, label="lateral",
+                         config_key="p4_ll_status_filter"):
+    """Return a status filter if it is usable, else None.
+
+    Tried once against the source before any HFML.  A filter that is invalid --
+    a renamed field, a typo -- or that matches nothing at all would silently
+    empty every map, so either case switches it off and says so.
     """
     status_filter = (status_filter or "").strip()
+    title = label[:1].upper() + label[1:]
     if not status_filter:
-        log_fn("Lateral status filter: off (p4_ll_status_filter is empty) — all statuses selected")
+        log_fn(f"{title} status filter: off ({config_key} is empty) — all statuses used")
         return None
     try:
-        with arcpy.da.SearchCursor(ll_source, ["OID@"], status_filter) as cursor:
+        with arcpy.da.SearchCursor(source, ["OID@"], status_filter) as cursor:
             matched = next(iter(cursor), None) is not None
     except Exception as exc:
         log_fn(
-            f"  WARNING: lateral status filter {status_filter!r} is not valid for the lateral "
-            f"source ({exc}) — selecting laterals of every status this run"
+            f"  WARNING: {label} status filter {status_filter!r} is not valid for the {label} "
+            f"source ({exc}) — using {label}s of every status this run"
         )
         return None
     if not matched:
         log_fn(
-            f"  WARNING: lateral status filter {status_filter!r} matches no laterals at all — "
-            "selecting laterals of every status this run"
+            f"  WARNING: {label} status filter {status_filter!r} matches no {label}s at all — "
+            f"using {label}s of every status this run"
         )
         return None
-    log_fn(f"Lateral status filter: {status_filter}")
+    log_fn(f"{title} status filter: {status_filter}")
     return status_filter
 
 
@@ -1778,6 +1830,16 @@ def _run(log_fn, layer_pool=None):
     ll_status_filter = _check_status_filter(
         arcpy, ll_source, config.get("p4_ll_status_filter"), log_fn
     )
+    ml_status_filter = _check_status_filter(
+        arcpy, ml_source, config.get("p4_ml_status_filter"), log_fn,
+        label="main", config_key="p4_ml_status_filter",
+    )
+    allowed_mls = None
+    if ml_status_filter:
+        # Read from the same copy the network was built from, so the OIDs match.
+        with arcpy.da.SearchCursor(ml_source, ["OID@"], ml_status_filter) as cursor:
+            allowed_mls = {oid for (oid,) in cursor}
+        log_fn(f"  {len(allowed_mls)} main(s) match it; the trace will not follow any other")
     _APPEND_PLANS.clear()
 
     assetnum_set = set(new_assetnums.values())
@@ -1835,6 +1897,8 @@ def _run(log_fn, layer_pool=None):
             _endpoint_index_store[token] = _endpoint_index(geoms_obj)
         return _endpoint_index_store[token]
 
+    _clear_leftover_trace_rows(arcpy, [ml_dest, ll_dest, parcels_dest], log_fn)
+
     dest_paths = [hfml_layer, ml_dest, ll_dest, parcels_dest]
     _write_phase4_map_manifest([], log_fn)
     hfml_records = []
@@ -1890,7 +1954,7 @@ def _run(log_fn, layer_pool=None):
             with timer.step("upstream trace"):
                 upstream_traced, downstream_key = _trace_upstream_directed(
                     seed_oids, directed_net, pipe_ups, pipe_dns, infer_direction=not use_nodes, log_fn=log_fn,
-                    endpoint_index=_endpoint_index_for(geoms),
+                    endpoint_index=_endpoint_index_for(geoms), allowed=allowed_mls,
                 )
             ml_oids = seed_oids + upstream_traced
             log_fn(f"Traced ML count (incl. seed): {len(ml_oids)}")

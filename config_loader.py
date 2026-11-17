@@ -90,6 +90,12 @@ OPTIONAL_DEFAULTS = {
     # saved on the Lower_Laterals layer in the map project; change both
     # together.  Empty selects every lateral regardless of status.
     "p4_ll_status_filter": "STATUS IN ('OPERATING', 'TOBEMOD')",
+    # The upstream trace only follows mains matching this: a main outside it
+    # is not mapped and nothing reached only through it is either.  Matches the
+    # filter saved on 'Trace Upstream High Freq PM' in the map project; change
+    # both together.  The HFML itself is always mapped.  Empty follows every
+    # main regardless of status.
+    "p4_ml_status_filter": "STATUS = 'OPERATING'",
 }
 
 

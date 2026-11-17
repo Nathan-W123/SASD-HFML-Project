@@ -81,6 +81,7 @@ to `config.json` — these keys are optional and default to on:
 | `p4_report_network_gaps` | `true` | log how close manholes sit without sharing a key (read-only) |
 | `p4_report_trace_gaps` | `true` | log unconnected pipe ends at the edge of each trace (read-only) |
 | `p4_ll_status_filter` | `"STATUS IN ('OPERATING', 'TOBEMOD')"` | only laterals matching this are selected, so their parcels follow; empty selects every status |
+| `p4_ml_status_filter` | `"STATUS = 'OPERATING'"` | the upstream trace only follows mains matching this; empty follows every main |
 
 ### One effect on the maps
 
@@ -207,10 +208,31 @@ neither is its parcel. The filter is checked once at the start of Phase 4; one
 that is invalid, or matches no laterals at all, is switched off with a warning
 rather than silently emptying every map.
 
-**Keep the two in step.** If the filter on `Lower_Laterals` in the map project
-changes, change `p4_ll_status_filter` to match. If they drift apart, the
-"N of the M appended this run are not drawn" warnings come back, which is the
-signal. The rewrite was
+Mains get the same treatment. `Trace Upstream High Freq PM` keeps only
+`STATUS = 'OPERATING'`, so the upstream trace now only follows mains matching
+`p4_ml_status_filter`: a non-operating main is not mapped, and neither is
+anything reached only through it — the mains above it, and the laterals and
+parcels on those. The HFML itself is always mapped. Each stop is logged:
+
+```
+Stopped at 1 main(s) outside the main status filter — not mapped, and nothing upstream of them is: [...]
+```
+
+**Keep each pair in step.** If the filter on `Lower_Laterals` or
+`Trace Upstream High Freq PM` in the map project changes, change
+`p4_ll_status_filter` or `p4_ml_status_filter` to match. If they drift apart,
+the "N of the M appended this run are not drawn" warnings come back, which is
+the signal.
+
+### Leftover rows in the trace tables
+
+Each map's rows are deleted from `Trace_SSGRAVITYMAIN`, `Lower_Laterals` and
+`Parcels_trace` once it is exported, so those tables should be empty between
+maps. Rows left by a run that did not finish cleaning up were drawn on every
+later map covering their area. Phase 4 now empties the three tables before its
+first map and logs what it removed. `PMs_SSGRAVITYMAIN` is never touched — a
+seed left there marks its HFML as already mapped. Like the per-map cleanup,
+this assumes one pipeline run at a time. The rewrite was
 checked against the previous implementation on 300 generated networks covering
 the edge cases — ends at exactly the search distance, laterals crossing a main
 mid-span, laterals tied in only at the downstream manhole, parcels on shared
