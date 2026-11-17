@@ -2,6 +2,7 @@ import os
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
+import gc
 import json
 import re
 import shutil
@@ -966,12 +967,28 @@ def _clear_layer_selections(arcpy, map_obj):
             has_selection = True
         if not has_selection:
             continue
+        # Layer.setSelectionSet is a property-level call, not a geoprocessing
+        # tool -- the tool took ~7s per layer (2026-11-17).  It only counts if
+        # the selection really is empty afterwards; otherwise the tool runs as
+        # before, so a map is never exported with a stale selection.
+        if _clear_selection_directly(layer):
+            cleared.append(layer.name)
+            continue
         try:
             arcpy.management.SelectLayerByAttribute(layer, "CLEAR_SELECTION")
-            cleared.append(layer.name)
+            cleared.append(f"{layer.name} (with the selection tool)")
         except Exception:
             pass
     return cleared
+
+
+def _clear_selection_directly(layer):
+    """Clear a layer's selection without a tool; True only if confirmed empty."""
+    try:
+        layer.setSelectionSet([], "NEW")
+        return not layer.getSelectionSet()
+    except Exception:
+        return False
 
 
 class _Stopwatch:
@@ -1111,13 +1128,243 @@ def _python_exe():
     return exe
 
 
-def export_hfml_map_out_of_process(hfml, config, log_fn):
-    """Export one HFML's map in a standalone Python process.
+def _job_config(base_config, hfml, log_fn):
+    """The config for one map: a fresh copy with this job's source overrides.
 
-    arcpy.mp layout export fails with "General Function Failure" when run
-    inside the ArcGIS Pro process (i.e. from the toolbox), so Phase 4 hands
-    each map to a separate python.exe and streams its output back.
+    Phase 4 may have read a local copy of a source instead of the path in
+    config.json.  The object IDs in this job belong to that copy, so use the
+    same paths here or the map would be drawn from whatever features happen to
+    carry those IDs in the remote source.  Always a copy, so one map's
+    overrides can never leak into the next when a process serves several.
     """
+    config = dict(base_config)
+    for key, value in (hfml.get("source_overrides") or {}).items():
+        if config.get(key) != value:
+            log_fn(f"Using Phase 4 source override: {key} -> {value}")
+        config[key] = value
+    return config
+
+
+def _export_one(arcpy, base_config, hfml, log_fn):
+    """Export one map.  The same steps whether the process serves one map or many."""
+    config = _job_config(base_config, hfml, log_fn)
+    hfml_id = str(hfml["pmnum"])
+    started = time.perf_counter()
+    observations_map = fetch_observations([hfml_id], config, log_fn)
+    log_fn(f"  export process: observations query {time.perf_counter() - started:.1f}s")
+    started = time.perf_counter()
+    export_hfml_map(arcpy, hfml, config, export_today(), observations_map, log_fn)
+    log_fn(f"  export process: build and export map {time.perf_counter() - started:.1f}s")
+
+
+# ---------------------------------------------------------------------------
+# One export process for the whole run
+#
+# arcpy.mp layout export fails with "General Function Failure" when run inside
+# the ArcGIS Pro process, so maps are exported by a separate python.exe.  That
+# process used to be started for every map, paying ~7.5s each time to start
+# Python and import arcpy (2026-11-17).  It is now started once and handed one
+# map at a time.  Each map still opens its own fresh copy of the project, so
+# nothing about one map can carry into the next.
+# ---------------------------------------------------------------------------
+
+_RESULT_MARKER = "@@HFML-EXPORT-RESULT@@ "
+# Start a fresh process after this many maps, so memory cannot build up over a
+# long run.
+EXPORT_WORKER_MAX_MAPS = 25
+
+
+def _export_worker_serve(handle_job, stdin=None, stdout=None):
+    """Read one JSON job per line, run it, and report a result line after it.
+
+    Everything else the job prints is passed through as log output.  Returns
+    when the input closes, which is how the parent ends the process.
+    """
+    stdin = stdin or sys.stdin
+    stdout = stdout or sys.stdout
+    while True:
+        line = stdin.readline()
+        if not line:
+            return
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            handle_job(json.loads(line))
+            result = {"ok": True}
+        except Exception:
+            print(traceback.format_exc(), file=stdout, flush=True)
+            result = {"ok": False}
+        # Release the job's project before reporting, so the parent can delete
+        # its scratch copy.
+        gc.collect()
+        print(_RESULT_MARKER + json.dumps(result), file=stdout, flush=True)
+
+
+def _export_worker_main():
+    # Entry point for the long-lived export process.
+    log_fn = lambda msg: print(msg, flush=True)
+    started = time.perf_counter()
+    try:
+        arcpy = _import_arcpy()
+    except Exception:
+        log_fn(traceback.format_exc())
+        print(_RESULT_MARKER + json.dumps({"ok": False, "fatal": True}), flush=True)
+        return
+    log_fn(f"  export process: started, arcpy import {time.perf_counter() - started:.1f}s "
+           "(paid once, not per map)")
+    # Same per-tool bookkeeping Phase 4 switches off; this is a separate
+    # python.exe so it has its own settings.  Nothing to restore: the process
+    # exits when Phase 4 is done.
+    from backend.phase4.run import _quiet_geoprocessing
+    _quiet_geoprocessing(arcpy).__enter__()
+    base_config = load_config()
+    _export_worker_serve(lambda hfml: _export_one(arcpy, base_config, hfml, log_fn))
+
+
+class _ExportWorker:
+    """Parent side of the long-lived export process."""
+
+    def __init__(self, command=None, max_maps=EXPORT_WORKER_MAX_MAPS):
+        self.command = command or [
+            _python_exe(), "-u", "-c",
+            "from backend.phase5.run import _export_worker_main; _export_worker_main()",
+        ]
+        self.max_maps = max_maps
+        self.proc = None
+        self.maps = 0
+        self.pending_scratch = []
+
+    def _start(self):
+        env = dict(os.environ, PYTHONIOENCODING="utf-8")
+        self.proc = subprocess.Popen(
+            self.command,
+            cwd=PROJECT_ROOT,
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        self.maps = 0
+
+    def _stop(self, timeout=60):
+        proc, self.proc = self.proc, None
+        if proc is None:
+            return
+        try:
+            if proc.stdin:
+                proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=timeout)
+        except Exception:
+            proc.kill()
+            proc.wait()
+
+    def _read_result(self, log_fn):
+        """Pass the job's output to the log; return its result, or None if the
+        process ended before reporting one."""
+        for line in self.proc.stdout:
+            line = line.rstrip()
+            if line.startswith(_RESULT_MARKER):
+                return json.loads(line[len(_RESULT_MARKER):])
+            if line:
+                log_fn(line)
+        return None
+
+    def export(self, hfml, scratch_path, log_fn):
+        hfml_id = str(hfml["pmnum"])
+        for attempt in (1, 2):
+            if self.proc is not None and self.maps >= self.max_maps:
+                log_fn(f"  export process: starting a fresh one after {self.maps} maps")
+                self._stop()
+            if self.proc is None or self.proc.poll() is not None:
+                self._start()
+            try:
+                self.proc.stdin.write(json.dumps(hfml) + "\n")
+                self.proc.stdin.flush()
+                result = self._read_result(log_fn)
+            except OSError:
+                result = None
+            if result is None:
+                # The process died mid-map (not a reported failure): its state
+                # is unknown, so discard it and give the map one clean retry.
+                self._stop(timeout=5)
+                self._remove_scratch(scratch_path, log_fn)
+                if attempt == 1:
+                    log_fn(f"  NOTE: export process stopped while exporting HFML {hfml_id} — "
+                           "starting a fresh one and retrying this map")
+                    continue
+                raise RuntimeError(f"Map export for HFML {hfml_id} failed (export process stopped twice)")
+            self.maps += 1
+            self._remove_scratch(scratch_path, log_fn)
+            if result.get("fatal"):
+                self._stop(timeout=5)
+                raise RuntimeError(f"Map export for HFML {hfml_id} failed (export process could not start)")
+            if not result.get("ok"):
+                raise RuntimeError(f"Map export for HFML {hfml_id} failed")
+            return hfml["pdf_path"]
+
+    def _remove_scratch(self, path, log_fn):
+        # The export process can keep the scratch project open until it exits;
+        # whatever cannot be removed now is removed when the process stops.
+        if path and os.path.exists(path):
+            try:
+                os.remove(path)
+            except Exception:
+                if path not in self.pending_scratch:
+                    self.pending_scratch.append(path)
+
+    def close(self, log_fn=None):
+        self._stop()
+        still = []
+        for path in self.pending_scratch:
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except Exception as exc:
+                still.append(path)
+                if log_fn:
+                    log_fn(f"  WARNING: could not remove scratch project {path} — {exc}")
+        self.pending_scratch = still
+
+
+_WORKER = None
+
+
+def close_export_worker(log_fn=None):
+    """Stop the shared export process, if one was started.  Phase 4 calls this
+    when it finishes, however it finishes."""
+    global _WORKER
+    worker, _WORKER = _WORKER, None
+    if worker is not None:
+        worker.close(log_fn)
+
+
+def export_hfml_map_out_of_process(hfml, config, log_fn):
+    """Export one HFML's map in a separate Python process.
+
+    By default one process serves every map in the run
+    (p4_export_reuse_process); set it false to start a process per map as
+    before.
+    """
+    global _WORKER
+    hfml_id = str(hfml["pmnum"])
+    scratch = _working_aprx_path(hfml.get("aprx_path") or resolve_project_path(config), hfml_id)
+    if config.get("p4_export_reuse_process", True):
+        if _WORKER is None:
+            _WORKER = _ExportWorker()
+        return _WORKER.export(hfml, scratch, log_fn)
+    return _export_in_own_process(hfml, scratch, log_fn)
+
+
+def _export_in_own_process(hfml, scratch, log_fn):
+    """The previous behaviour: a new process for this one map."""
     hfml_id = str(hfml["pmnum"])
     os.makedirs(os.path.dirname(EXPORT_JOB_PATH), exist_ok=True)
     with open(EXPORT_JOB_PATH, "w") as f:
@@ -1143,12 +1390,11 @@ def export_hfml_map_out_of_process(hfml, config, log_fn):
 
     # The export process holds the scratch project open until it exits, so its
     # own cleanup can fail; remove it here now that the lock is released.
-    tmp_aprx = _working_aprx_path(hfml.get("aprx_path") or resolve_project_path(config), hfml_id)
-    if os.path.exists(tmp_aprx):
+    if os.path.exists(scratch):
         try:
-            os.remove(tmp_aprx)
+            os.remove(scratch)
         except Exception as exc:
-            log_fn(f"  WARNING: could not remove scratch project {tmp_aprx} — {exc}")
+            log_fn(f"  WARNING: could not remove scratch project {scratch} — {exc}")
 
     if returncode != 0:
         raise RuntimeError(f"Map export for HFML {hfml_id} failed (exit code {returncode})")
@@ -1156,11 +1402,7 @@ def export_hfml_map_out_of_process(hfml, config, log_fn):
 
 
 def _run_export_job():
-    # Entry point for the standalone export process started above.
-    #
-    # Timed in three parts.  Phase 4 measures this process's whole wall time,
-    # so the part it reports minus these three is the cost of starting a Python
-    # interpreter and importing this module -- which is paid once per HFML.
+    # Entry point for the one-map export process (p4_export_reuse_process off).
     log_fn = lambda msg: print(msg, flush=True)
     try:
         with open(EXPORT_JOB_PATH, "r") as f:
@@ -1168,29 +1410,9 @@ def _run_export_job():
         started = time.perf_counter()
         arcpy = _import_arcpy()
         log_fn(f"  export process: arcpy import {time.perf_counter() - started:.1f}s")
-        # Same per-tool bookkeeping Phase 4 switches off; this is a separate
-        # python.exe so it has its own settings.  Nothing to restore: the
-        # process exits when the export is done.
         from backend.phase4.run import _quiet_geoprocessing
-        quiet = _quiet_geoprocessing(arcpy)
-        quiet.__enter__()
-        config = load_config()
-        # Phase 4 may have read a local copy of a source instead of the path in
-        # config.json.  The object IDs in this job belong to that copy, so use
-        # the same paths here or the map would be drawn from whatever features
-        # happen to carry those IDs in the remote source.
-        overrides = hfml.get("source_overrides") or {}
-        for key, value in overrides.items():
-            if config.get(key) != value:
-                log_fn(f"Using Phase 4 source override: {key} -> {value}")
-            config[key] = value
-        hfml_id = str(hfml["pmnum"])
-        started = time.perf_counter()
-        observations_map = fetch_observations([hfml_id], config, log_fn)
-        log_fn(f"  export process: observations query {time.perf_counter() - started:.1f}s")
-        started = time.perf_counter()
-        export_hfml_map(arcpy, hfml, config, export_today(), observations_map, log_fn)
-        log_fn(f"  export process: build and export map {time.perf_counter() - started:.1f}s")
+        _quiet_geoprocessing(arcpy).__enter__()
+        _export_one(arcpy, load_config(), hfml, log_fn)
     except Exception:
         log_fn(traceback.format_exc())
         raise SystemExit(1)

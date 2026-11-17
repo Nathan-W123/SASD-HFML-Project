@@ -13,12 +13,17 @@ def check(name, cond, detail=""):
     if not cond: fails.append(name)
 
 class Layer:
-    def __init__(self, name, selection=None, group=False, feature=True, raises=False, query=""):
+    def __init__(self, name, selection=None, group=False, feature=True, raises=False, query="",
+                 direct="works"):
         self.name, self._sel, self.isGroupLayer, self.isFeatureLayer = name, selection, group, feature
         self._raises, self.definitionQuery, self.dataSource = raises, query, "src"
+        self._direct = direct   # how setSelectionSet behaves: works | raises | ignored
     def getSelectionSet(self):
         if self._raises: raise RuntimeError("not supported")
         return self._sel
+    def setSelectionSet(self, oids=None, method="NEW"):
+        if self._direct == "raises": raise ValueError("oidList is empty")
+        if self._direct == "works": self._sel = set(oids or ())
     def supports(self, what): return True
 
 class Map:
@@ -39,11 +44,23 @@ m = Map([
 ])
 n = P5._clear_layer_selections(arcpy, m)
 names = [c[0] for c in calls]
-check("clears a layer that has a selection", "has selection" in names, names)
+check("clears a layer that has a selection", "has selection" in n, n)
 check("falls back to clearing when a layer cannot report", "cannot tell" in names, names)
 check("skips layers with nothing selected", not {"no selection (normal)", "None selection"} & set(names), names)
 check("skips group and non-feature layers", not {"group", "basemap"} & set(names), names)
-check("returns the layers it cleared", sorted(n) == ["cannot tell", "has selection"], n)
+check("returns the layers it cleared", sorted(n) == ["cannot tell (with the selection tool)", "has selection"], n)
+check("cleared directly, no tool call for it", ("has selection", "CLEAR_SELECTION") not in calls, calls)
+check("selection really empty afterwards", not m._layers[2].getSelectionSet(), m._layers[2]._sel)
+
+# setSelectionSet raising, or returning without clearing: the tool runs instead
+calls.clear()
+raising = Layer("raises", selection={1}, direct="raises")
+ignoring = Layer("ignored", selection={1}, direct="ignored")
+n = P5._clear_layer_selections(arcpy, Map([raising, ignoring]))
+names = [c[0] for c in calls]
+check("tool used when the direct clear raises", "raises" in names, names)
+check("tool used when the direct clear did not take", "ignored" in names, names)
+check("fallbacks reported as such", sorted(n) == ["ignored (with the selection tool)", "raises (with the selection tool)"], n)
 
 # 20 layers, none selected: zero geoprocessing calls (was 20)
 calls.clear()

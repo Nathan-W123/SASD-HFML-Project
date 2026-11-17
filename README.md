@@ -106,6 +106,7 @@ to `config.json` — these keys are optional and default to on:
 | `p4_report_trace_gaps` | `true` | log unconnected pipe ends at the edge of each trace (read-only) |
 | `p4_ll_status_filter` | `"STATUS IN ('OPERATING', 'TOBEMOD')"` | only laterals matching this are selected, so their parcels follow; empty selects every status |
 | `p4_ml_status_filter` | `"STATUS = 'OPERATING'"` | the upstream trace only follows mains matching this; empty follows every main |
+| `p4_export_reuse_process` | `true` | export every map from one Python process; `false` starts one per map as before |
 
 ### One effect on the maps
 
@@ -202,6 +203,27 @@ Two more geoprocessing-heavy steps were then rewritten the same way:
 
 Both were checked against the code they replace on generated data before
 shipping.
+
+### The map export
+
+Measured on 2026-11-17, each map's export took ~38s: ~15s clearing two
+selections saved in the map project, ~7.5s starting Python and importing arcpy,
+~5s scoping layers to the view, and ~2.5s actually exporting the PDF. Two
+changes, each with a fallback to the previous behaviour:
+
+- **One export process for the run.** Layout export fails inside the ArcGIS
+  Pro process, so maps are exported by a separate `python.exe` — previously one
+  started per map. One process now serves every map, paying the arcpy import
+  once. Each map still opens its own fresh copy of the project and gets its own
+  copy of the config, so nothing carries from one map to the next. If the
+  process dies mid-map it is replaced and that map retried once; it is also
+  replaced every 25 maps so memory cannot build up. `p4_export_reuse_process:
+  false` restores one process per map.
+- **Selections cleared without the tool.** A layer with a saved selection is
+  cleared with `Layer.setSelectionSet`, then checked; only if it is still
+  selected does the selection tool run, as before. A map is never exported
+  with a stale selection either way. Clearing the selections in the project
+  and saving it removes the step entirely.
 
 ### Appended features that are not drawn
 

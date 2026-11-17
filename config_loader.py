@@ -96,6 +96,10 @@ OPTIONAL_DEFAULTS = {
     # both together.  The HFML itself is always mapped.  Empty follows every
     # main regardless of status.
     "p4_ml_status_filter": "STATUS = 'OPERATING'",
+    # Export every map in the run from one Python process instead of starting
+    # one per map (~7.5s each to start Python and import arcpy).  Each map still
+    # opens its own fresh copy of the project.  False restores one per map.
+    "p4_export_reuse_process": True,
 }
 
 

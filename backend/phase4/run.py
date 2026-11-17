@@ -1739,8 +1739,13 @@ def _setup_phase4_cache(arcpy, config, ml_source, log_fn):
 
 def run(log_fn):
     arcpy = _import_arcpy()
-    with _quiet_geoprocessing(arcpy, log_fn), _layer_pool(arcpy) as layer_pool:
-        return _run(log_fn, layer_pool=layer_pool)
+    # Imported here: phase5 imports PHASE4_MAP_OUTPUT_PATH from this module.
+    from backend.phase5.run import close_export_worker
+    try:
+        with _quiet_geoprocessing(arcpy, log_fn), _layer_pool(arcpy) as layer_pool:
+            return _run(log_fn, layer_pool=layer_pool)
+    finally:
+        close_export_worker(log_fn)
 
 
 def _run(log_fn, layer_pool=None):
