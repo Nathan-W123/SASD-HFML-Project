@@ -46,7 +46,7 @@ The pipeline runs inside ArcGIS Pro's Python environment, which needs `pyodbc`, 
 2. Expand the toolbox and double-click **Run HFML Pipeline**. All five phases are checked under **Phases to run**; uncheck any you want to skip (e.g. to rerun a single phase), then click **Run**.
 3. Progress and log output appear in the Geoprocessing pane (and under **View Details** / Geoprocessing History). Checked phases run in order 1 through 5; the tool stops at the first failed phase and reports the error.
 
-Edits to the backend scripts take effect on the next run without restarting Pro. After editing `SASD_HFML.pyt` itself, right-click the toolbox and choose **Refresh**.
+Edits to the backend scripts — including helper modules such as `backend/phase4/network_cache.py` — take effect on the next run without restarting Pro: the toolbox reloads them at the start of every run. After editing `SASD_HFML.pyt` itself, right-click the toolbox and choose **Refresh**.
 
 ## Phase 4 caching
 

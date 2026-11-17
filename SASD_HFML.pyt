@@ -66,6 +66,14 @@ class RunPipeline:
         # Pro keeps modules cached between runs; reload so code edits take effect without restarting Pro.
         # Reload every phase (not just the selected ones) since Phase 4 imports helpers from Phase 5.
         importlib.reload(importlib.import_module("config_loader"))
+        # Helper modules (e.g. backend/phase4/network_cache.py) first, so the phase
+        # modules below re-import the fresh copies rather than the cached ones.
+        phase_names = {name for name, _ in PHASES}
+        for name in sorted(n for n in list(sys.modules) if n.startswith("backend.")):
+            module = sys.modules.get(name)
+            if name in phase_names or module is None or not getattr(module, "__file__", None):
+                continue
+            importlib.reload(module)
         modules = [importlib.reload(importlib.import_module(name)) for name, _ in PHASES]
         for i, ((_, label), module) in enumerate(zip(PHASES, modules), 1):
             if _phase_choice(i, label) not in selected:
