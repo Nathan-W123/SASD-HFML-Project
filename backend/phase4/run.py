@@ -837,9 +837,103 @@ def _trace_upstream_directed(
     return to_append, dn_key
 
 
-def _append_by_oids(arcpy, oid_list, source, destination):
+# Field plans for the direct row copy, per (source, destination), for this run.
+_APPEND_PLANS = {}
+_SKIP_FIELD_TYPES = {"OID", "Geometry", "GlobalID", "Blob", "Raster"}
+
+
+def _append_plan(arcpy, source, destination):
+    """How to copy rows from source to destination without the Append tool.
+
+    Mirrors Append NO_TEST: fields are matched by name, ignoring case; a
+    destination field with no match is left empty; object IDs, geometry
+    bookkeeping fields and GlobalIDs are not copied.  The direct copy is only
+    used when both sides share a coordinate system, since a cursor does not
+    reproject the way Append does.
+    """
+    key = (source, destination)
+    plan = _APPEND_PLANS.get(key)
+    if plan is not None:
+        return plan
+    source_fields = {
+        f.name.lower(): f for f in arcpy.ListFields(source) if f.type not in _SKIP_FIELD_TYPES
+    }
+    pairs = []
+    for f in arcpy.ListFields(destination):
+        if f.type in _SKIP_FIELD_TYPES or not f.editable:
+            continue
+        match = source_fields.get(f.name.lower())
+        if match is not None:
+            pairs.append((match.name, f.name, match.type, f.type))
+    try:
+        src_sr = arcpy.Describe(source).spatialReference
+        dst_sr = arcpy.Describe(destination).spatialReference
+        same_sr = (src_sr.factoryCode, src_sr.name) == (dst_sr.factoryCode, dst_sr.name)
+    except Exception:
+        same_sr = False
+    plan = {"pairs": pairs, "direct": same_sr, "reason": None if same_sr else "coordinate systems differ"}
+    _APPEND_PLANS[key] = plan
+    return plan
+
+
+def _delete_oids(arcpy, path, oids):
+    for chunk in _chunks(sorted(set(oids))):
+        with arcpy.da.UpdateCursor(path, ["OID@"], _oid_where(chunk)) as cursor:
+            for _ in cursor:
+                cursor.deleteRow()
+
+
+def _append_rows_directly(arcpy, oid_list, source, destination, plan):
+    """Copy rows with a search cursor into an insert cursor.
+
+    The Append tool measured 4-9s per call (2026-11-17), the same fixed cost
+    every other geoprocessing tool showed, for a handful of rows.  If anything
+    fails part-way the rows inserted so far are deleted again, so the caller
+    can fall back to Append without leaving duplicates.
+    """
+    pairs = plan["pairs"]
+    src_names = ["SHAPE@"] + [p[0] for p in pairs]
+    dst_names = ["SHAPE@"] + [p[1] for p in pairs]
+    inserted = []
+    try:
+        with arcpy.da.InsertCursor(destination, dst_names) as insert:
+            for chunk in _chunks(sorted(set(oid_list))):
+                with arcpy.da.SearchCursor(source, src_names, _oid_where(chunk)) as cursor:
+                    for row in cursor:
+                        values = [row[0]]
+                        for value, (_, _, src_type, dst_type) in zip(row[1:], pairs):
+                            values.append(value if src_type == dst_type else _coerce_for_field(value, dst_type))
+                        inserted.append(insert.insertRow(values))
+    except Exception:
+        try:
+            _delete_oids(arcpy, destination, [oid for oid in inserted if oid is not None])
+        except Exception as cleanup_exc:
+            raise RuntimeError(
+                f"direct copy into {destination} failed and its {len(inserted)} partial row(s) "
+                f"could not be removed: {cleanup_exc}"
+            ) from cleanup_exc
+        raise
+    return len(inserted)
+
+
+def _append_by_oids(arcpy, oid_list, source, destination, log_fn=None):
     if not oid_list:
         return
+    plan = _append_plan(arcpy, source, destination)
+    if plan["direct"]:
+        try:
+            _append_rows_directly(arcpy, oid_list, source, destination, plan)
+            return
+        except Exception as exc:
+            # Don't keep paying for a failing fast path: use Append for this
+            # pair for the rest of the run.
+            plan["direct"] = False
+            plan["reason"] = str(exc)
+            if log_fn:
+                log_fn(
+                    f"  NOTE: direct row copy into {destination} failed ({exc}) — "
+                    "using the Append tool for it for the rest of this run"
+                )
     query = f"OBJECTID IN ({','.join(map(str, oid_list))})"
     subset_layer = _replace_temp_layer(arcpy, "_TmpSubset", source, query)
     try:
@@ -944,15 +1038,19 @@ def _oid_where(oids):
     return f"OBJECTID IN ({','.join(str(int(oid)) for oid in oids)})"
 
 
-def _read_geometries(arcpy, source, oids):
+def _read_geometries(arcpy, source, oids, extra_where=None):
     """{oid: geometry} for these OIDs, straight from the dataset.
 
     Reads the dataset by path, never through a layer, so an empty selection
-    can't silently widen the read to every feature.
+    can't silently widen the read to every feature.  extra_where narrows the
+    read further (e.g. the lateral status filter).
     """
     out = {}
     for chunk in _chunks(sorted(set(oids))):
-        with arcpy.da.SearchCursor(source, ["OID@", "SHAPE@"], _oid_where(chunk)) as cursor:
+        where = _oid_where(chunk)
+        if extra_where:
+            where = f"({where}) AND ({extra_where})"
+        with arcpy.da.SearchCursor(source, ["OID@", "SHAPE@"], where) as cursor:
             for oid, geom in cursor:
                 if geom is not None:
                     out[oid] = geom
@@ -1063,9 +1161,39 @@ def _layer_pool(arcpy):
         pool.close()
 
 
+def _check_status_filter(arcpy, ll_source, status_filter, log_fn):
+    """Return the lateral status filter if it is usable, else None.
+
+    Tried once against the lateral source before any HFML.  A filter that is
+    invalid -- a renamed field, a typo -- or that matches no lateral at all
+    would silently empty every map, so either case switches it off and says so.
+    """
+    status_filter = (status_filter or "").strip()
+    if not status_filter:
+        log_fn("Lateral status filter: off (p4_ll_status_filter is empty) — all statuses selected")
+        return None
+    try:
+        with arcpy.da.SearchCursor(ll_source, ["OID@"], status_filter) as cursor:
+            matched = next(iter(cursor), None) is not None
+    except Exception as exc:
+        log_fn(
+            f"  WARNING: lateral status filter {status_filter!r} is not valid for the lateral "
+            f"source ({exc}) — selecting laterals of every status this run"
+        )
+        return None
+    if not matched:
+        log_fn(
+            f"  WARNING: lateral status filter {status_filter!r} matches no laterals at all — "
+            "selecting laterals of every status this run"
+        )
+        return None
+    log_fn(f"Lateral status filter: {status_filter}")
+    return status_filter
+
+
 def _select_lls_contacting_mls(
     arcpy, ml_oid_list, ml_source, ll_source, downstream_point=None, log_fn=None,
-    timer=None, layers=None,
+    timer=None, layers=None, status_filter=None,
 ):
     """Laterals with an end within LL_SEARCH_FEET of a traced main.
 
@@ -1101,8 +1229,15 @@ def _select_lls_contacting_mls(
             return []
 
         with timer.substep("LL: read laterals and traced MLs"):
-            candidates = _read_geometries(arcpy, ll_source, candidate_oids)
+            # Laterals outside the status filter are dropped here, before the
+            # endpoint test, so they are never appended and their parcels are
+            # never selected -- the same laterals the map template hides.
+            candidates = _read_geometries(arcpy, ll_source, candidate_oids, extra_where=status_filter)
             mains = list(_read_geometries(arcpy, ml_source, ml_oid_list).values())
+        if status_filter and log_fn:
+            skipped = len(candidate_oids) - len(candidates)
+            if skipped:
+                log_fn(f"Skipped {skipped} lateral(s) outside the status filter ({status_filter})")
 
         with timer.substep("LL: endpoint test (Python)"):
             hits = (
@@ -1255,7 +1390,7 @@ def _append_seed_to_hfml_layer(arcpy, seed_oids, ml_source, hfml_layer, pmnum, p
 
     max_oid = _get_max_oid(arcpy, hfml_layer)
 
-    _append_by_oids(arcpy, list(seed_oids), ml_source, hfml_layer)
+    _append_by_oids(arcpy, list(seed_oids), ml_source, hfml_layer, log_fn=log_fn)
 
     if not has_pmnum_field:
         log_fn(f"  HFML seed appended for pmnum {pmnum} ('{pmnum_field}' not found — attributes not stamped)")
@@ -1640,6 +1775,11 @@ def _run(log_fn, layer_pool=None):
     for key, path in sorted(source_overrides.items()):
         log_fn(f"Using local copy for {key}: {path}")
 
+    ll_status_filter = _check_status_filter(
+        arcpy, ll_source, config.get("p4_ll_status_filter"), log_fn
+    )
+    _APPEND_PLANS.clear()
+
     assetnum_set = set(new_assetnums.values())
     with timer.step("assetnum lookup"):
         assetnum_segments = _read_assetnum_segments(
@@ -1759,7 +1899,7 @@ def _run(log_fn, layer_pool=None):
             # in the HFML layer (already written above via _append_seed_to_hfml_layer).
             upstream_ml_oids = list(upstream_traced)
             with timer.step("append upstream MLs"):
-                _append_by_oids(arcpy, upstream_ml_oids, ml_source, ml_dest)
+                _append_by_oids(arcpy, upstream_ml_oids, ml_source, ml_dest, log_fn=log_fn)
             log_fn(f"Appended {len(upstream_ml_oids)} upstream ML segments (seed excluded)")
 
             # LLs are found from the HFML and its upstream MLs only (ml_oids).
@@ -1776,12 +1916,12 @@ def _run(log_fn, layer_pool=None):
                 ll_oids = _select_lls_contacting_mls(
                     arcpy, ml_oids, ml_source, ll_source,
                     downstream_point=downstream_point, log_fn=log_fn, timer=timer,
-                    layers=layer_pool,
+                    layers=layer_pool, status_filter=ll_status_filter,
                 )
             log_fn(f"Selected LL count: {len(ll_oids)}")
             log_fn(f"Selected LL OID preview: {_preview_oids(ll_oids)}")
             with timer.step("append LLs"):
-                _append_by_oids(arcpy, ll_oids, ll_source, ll_dest)
+                _append_by_oids(arcpy, ll_oids, ll_source, ll_dest, log_fn=log_fn)
             log_fn(f"Appended {len(ll_oids)} LLs")
 
             with timer.step("select parcels (remote parcels source)"):
@@ -1793,7 +1933,7 @@ def _run(log_fn, layer_pool=None):
             log_fn(f"Selected parcel count: {len(parcel_oids)}")
             log_fn(f"Selected parcel OID preview: {_preview_oids(parcel_oids)}")
             with timer.step("append parcels"):
-                _append_by_oids(arcpy, parcel_oids, parcels_source, parcels_dest)
+                _append_by_oids(arcpy, parcel_oids, parcels_source, parcels_dest, log_fn=log_fn)
             log_fn(f"Appended {len(parcel_oids)} parcels")
 
             record = {

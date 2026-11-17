@@ -85,6 +85,11 @@ OPTIONAL_DEFAULTS = {
     # Report unconnected pipe ends just off the edge of each trace, which is
     # what a cut-off branch looks like.  Read-only.
     "p4_report_trace_gaps": True,
+    # Only laterals matching this are selected, so a lateral the map would
+    # hide never brings its parcel onto the map either.  Matches the filter
+    # saved on the Lower_Laterals layer in the map project; change both
+    # together.  Empty selects every lateral regardless of status.
+    "p4_ll_status_filter": "STATUS IN ('OPERATING', 'TOBEMOD')",
 }
 
 

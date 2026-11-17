@@ -80,6 +80,7 @@ to `config.json` — these keys are optional and default to on:
 | `p4_node_snap_tolerance_feet` | `0.1` | pipe ends this far apart count as one manhole; `0` restores exact matching |
 | `p4_report_network_gaps` | `true` | log how close manholes sit without sharing a key (read-only) |
 | `p4_report_trace_gaps` | `true` | log unconnected pipe ends at the edge of each trace (read-only) |
+| `p4_ll_status_filter` | `"STATUS IN ('OPERATING', 'TOBEMOD')"` | only laterals matching this are selected, so their parcels follow; empty selects every status |
 
 ### One effect on the maps
 
@@ -161,6 +162,22 @@ every layer in the project, though the export opens a fresh copy of the project
 in its own process where nothing is normally selected. It now asks each layer
 whether it has a selection first (a property read) and clears only those.
 
+Two more geoprocessing-heavy steps were then rewritten the same way:
+
+- **Appends** copy rows with a search cursor into an insert cursor instead of
+  the Append tool (4–9s per call measured). Fields are matched by name ignoring
+  case, as Append NO_TEST does. Only used when source and destination share a
+  coordinate system, since a cursor does not reproject; if a copy fails
+  part-way the rows it inserted are deleted and that destination falls back to
+  Append for the rest of the run.
+- **Map-view filtering** in the export reads each trace layer's dataset through
+  the layer's saved definition query and keeps features not disjoint from the
+  view, instead of a select-by-location plus clear per layer (~10s a map). Any
+  failure falls back to the tool method for that layer.
+
+Both were checked against the code they replace on generated data before
+shipping.
+
 ### Appended features that are not drawn
 
 The export narrows each trace layer to the map view by reading the layer and
@@ -175,8 +192,25 @@ export now logs any saved query it replaces:
 Layer 'Lower_Laterals' has a definition query saved in the project: '...' — appended features it excludes are not drawn
 ```
 
-Whether those features should show is a decision about the template, not the
-code: remove or change the saved query in the project if they should. The rewrite was
+Those queries turned out to be status filters (2026-11-17):
+
+```
+Lower_Laterals:              STATUS in( 'OPERATING', 'TOBEMOD')
+Trace Upstream High Freq PM: STATUS = 'OPERATING'
+```
+
+So laterals that were not in service were selected and appended, then hidden
+by the template — while their parcels, which carry no such filter, were still
+drawn. Phase 4 now applies the same filter when it selects laterals
+(`p4_ll_status_filter`), so a non-operating lateral is never selected and
+neither is its parcel. The filter is checked once at the start of Phase 4; one
+that is invalid, or matches no laterals at all, is switched off with a warning
+rather than silently emptying every map.
+
+**Keep the two in step.** If the filter on `Lower_Laterals` in the map project
+changes, change `p4_ll_status_filter` to match. If they drift apart, the
+"N of the M appended this run are not drawn" warnings come back, which is the
+signal. The rewrite was
 checked against the previous implementation on 300 generated networks covering
 the edge cases — ends at exactly the search distance, laterals crossing a main
 mid-span, laterals tied in only at the downstream manhole, parcels on shared

@@ -258,6 +258,38 @@ def _get_layout(aprx, layout_name):
     raise RuntimeError(f"Layout '{layout_name}' not found. Available layouts: {available}")
 
 
+def _oids_in_view_python(arcpy, layer, saved_query, view_polygon):
+    """OIDs of a layer's features that intersect the map view, without tools.
+
+    Reads the layer's dataset through the layer's own saved definition query --
+    exactly the features the layer would draw -- and keeps those whose geometry
+    is not disjoint from the view, the same intersect test SelectLayerByLocation
+    INTERSECT applies, after a cheap extent check.  The tool version cost ~10s a
+    map in geoprocessing overhead (2026-11-17) for a few hundred rows.
+    """
+    view = view_polygon.extent
+    oids = []
+    with arcpy.da.SearchCursor(layer.dataSource, ["OID@", "SHAPE@"], saved_query or None) as cursor:
+        for oid, geom in cursor:
+            if geom is None:
+                continue
+            ext = geom.extent
+            if (ext.XMax < view.XMin or ext.XMin > view.XMax
+                    or ext.YMax < view.YMin or ext.YMin > view.YMax):
+                continue
+            if not geom.disjoint(view_polygon):
+                oids.append(oid)
+    return sorted(oids)
+
+
+def _oids_in_view_with_tools(arcpy, layer, view_polygon):
+    """The previous method, kept as the fallback."""
+    arcpy.management.SelectLayerByLocation(layer, "INTERSECT", view_polygon)
+    oids = [r[0] for r in arcpy.da.SearchCursor(layer, ["OID@"])]
+    arcpy.management.SelectLayerByAttribute(layer, "CLEAR_SELECTION")
+    return oids
+
+
 def _scope_layers(arcpy, map_obj, hfml_id, content_extent=None, log_fn=None):
     trace_names = {
         "Trace_SSGRAVITYMAIN",
@@ -303,9 +335,15 @@ def _scope_layers(arcpy, map_obj, hfml_id, content_extent=None, log_fn=None):
                     ]),
                     sr,
                 )
-                arcpy.management.SelectLayerByLocation(layer, "INTERSECT", ext_poly)
-                oids = [r[0] for r in arcpy.da.SearchCursor(layer, ["OID@"])]
-                arcpy.management.SelectLayerByAttribute(layer, "CLEAR_SELECTION")
+                try:
+                    oids = _oids_in_view_python(arcpy, layer, saved_query, ext_poly)
+                except Exception as py_exc:
+                    if log_fn:
+                        log_fn(
+                            f"  NOTE: could not filter layer '{layer.name}' in Python ({py_exc}) — "
+                            "using the selection tools"
+                        )
+                    oids = _oids_in_view_with_tools(arcpy, layer, ext_poly)
                 layer.definitionQuery = (
                     f"OBJECTID IN ({','.join(map(str, oids))})" if oids else "1=0"
                 )
@@ -916,9 +954,9 @@ def _clear_layer_selections(arcpy, map_obj):
     getSelectionSet() is a plain property read, so asking first is free.
 
     A layer that cannot report its selection is cleared anyway, as before.
-    Returns how many layers were cleared.
+    Returns the names of the layers that were cleared.
     """
-    cleared = 0
+    cleared = []
     for layer in map_obj.listLayers():
         if layer.isGroupLayer or not getattr(layer, "isFeatureLayer", True):
             continue
@@ -930,7 +968,7 @@ def _clear_layer_selections(arcpy, map_obj):
             continue
         try:
             arcpy.management.SelectLayerByAttribute(layer, "CLEAR_SELECTION")
-            cleared += 1
+            cleared.append(layer.name)
         except Exception:
             pass
     return cleared
@@ -988,7 +1026,10 @@ def export_hfml_map(arcpy, hfml, config, today, observations_map, log_fn):
         with watch.part("clear selections"):
             cleared = _clear_layer_selections(arcpy, map_obj)
         if cleared:
-            log_fn(f"  Cleared selections left on {cleared} layer(s) in the project")
+            log_fn(
+                f"  Cleared selections saved in the project on {len(cleared)} layer(s): "
+                f"{', '.join(cleared)} — clear them in the project and save to skip this"
+            )
 
         with watch.part("layout and camera"):
             layout = _get_layout(aprx, layout_name)
