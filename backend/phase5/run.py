@@ -1048,6 +1048,12 @@ def _run_export_job():
         started = time.perf_counter()
         arcpy = _import_arcpy()
         log_fn(f"  export process: arcpy import {time.perf_counter() - started:.1f}s")
+        # Same per-tool bookkeeping Phase 4 switches off; this is a separate
+        # python.exe so it has its own settings.  Nothing to restore: the
+        # process exits when the export is done.
+        from backend.phase4.run import _quiet_geoprocessing
+        quiet = _quiet_geoprocessing(arcpy)
+        quiet.__enter__()
         config = load_config()
         # Phase 4 may have read a local copy of a source instead of the path in
         # config.json.  The object IDs in this job belong to that copy, so use

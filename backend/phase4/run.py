@@ -107,6 +107,70 @@ def _norm_id(value):
     return str(int(number)) if number.is_integer() else text
 
 
+@contextmanager
+def _quiet_geoprocessing(arcpy, log_fn=None):
+    """Switch off ArcGIS Pro's per-tool bookkeeping for the duration.
+
+    Measured on 2026-11-17: every geoprocessing tool call in Phase 4 cost 3-6s
+    whatever it did -- CreateFeatureclass + two AddFields ~16s, each Delete ~3s,
+    while the row inserts and Describes they surround cost 0.0s.  That floor is
+    Pro writing geoprocessing history and lineage metadata on every call, and
+    with the project on a network share each write pays a round trip.
+
+    Turned off: history logging, metadata logging, and adding tool outputs to
+    the open map.  The previous values are restored afterwards, including on
+    failure, so the user's Pro session is left as it was found.  Each setting is
+    skipped if this Pro version lacks it.
+    """
+    saved = []
+
+    def _switch(label, getter, setter):
+        try:
+            previous = getter()
+        except Exception:
+            return
+        try:
+            setter(False)
+        except Exception:
+            return
+        saved.append((label, setter, previous))
+
+    for label, get_name, set_name in (
+        ("history logging", "GetLogHistory", "SetLogHistory"),
+        ("metadata logging", "GetLogMetadata", "SetLogMetadata"),
+    ):
+        getter = getattr(arcpy, get_name, None)
+        setter = getattr(arcpy, set_name, None)
+        if getter is not None and setter is not None:
+            _switch(label, getter, setter)
+    env = getattr(arcpy, "env", None)
+    if env is not None and hasattr(env, "addOutputsToMap"):
+        _switch(
+            "adding outputs to the map",
+            lambda: env.addOutputsToMap,
+            lambda v: setattr(env, "addOutputsToMap", v),
+        )
+
+    if log_fn:
+        if saved:
+            log_fn(
+                "Geoprocessing bookkeeping off for this phase: "
+                + ", ".join(label for label, _, _ in saved)
+                + " (restored afterwards)"
+            )
+        else:
+            log_fn("Geoprocessing bookkeeping: no switchable settings in this Pro version")
+    try:
+        yield
+    finally:
+        for label, setter, previous in reversed(saved):
+            try:
+                setter(previous)
+            except Exception as exc:
+                if log_fn:
+                    log_fn(f"  WARNING: could not restore {label} — {exc}")
+
+
 _SCRATCH_WORKSPACE = {}
 
 
@@ -1486,6 +1550,12 @@ def _setup_phase4_cache(arcpy, config, ml_source, log_fn):
 
 
 def run(log_fn):
+    arcpy = _import_arcpy()
+    with _quiet_geoprocessing(arcpy, log_fn):
+        return _run(log_fn)
+
+
+def _run(log_fn):
     # Imported here: phase5 imports PHASE4_MAP_OUTPUT_PATH from this module.
     from backend.phase5.run import (
         export_hfml_map_out_of_process, find_mapped_pdfs, new_run_dir, resolve_project_path,

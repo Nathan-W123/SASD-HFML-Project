@@ -124,6 +124,22 @@ twice per HFML, whatever the data volume — plus deleting them again. That is
 fixed geoprocessing overhead against the legacy `in_memory` workspace, so the
 scratch workspace is now the modern `memory`, with `in_memory` as a fallback.
 
+That did not move it. Timing each tool call individually (2026-11-17) showed
+the real pattern: **every geoprocessing tool call costs 3–6 seconds whatever it
+does** — CreateFeatureclass plus two AddFields ~16s, each Delete ~3s, each
+Append 5–9s — while the row inserts and Describes between them cost 0.0s.
+Phase 4 makes dozens of tool calls per HFML.
+
+That floor is Pro writing geoprocessing history and lineage metadata on every
+call, with the project on a network share. Phase 4 and the export process now
+switch off history logging, metadata logging and adding outputs to the map for
+their duration, restoring the previous settings afterwards. The log line
+`Geoprocessing bookkeeping off for this phase` confirms which were switched.
+
+If that does not bring the per-call cost down, the remaining fix is structural:
+the scratch endpoint feature classes exist only to run a one-foot distance test,
+which plain Python geometry can do with no tool calls at all.
+
 Interpreter startup turned out to be negligible: of 68s per export, 5.5s was
 importing arcpy and 61s was building and exporting the map, leaving about 2s of
 process startup. Replacing the per-HFML subprocess would save ~27s a run.
