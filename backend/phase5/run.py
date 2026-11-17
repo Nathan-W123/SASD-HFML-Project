@@ -280,6 +280,17 @@ def _scope_layers(arcpy, map_obj, hfml_id, content_extent=None, log_fn=None):
             # Filter to only the features visible in the padded map view.
             # Uses content_extent which should be the camera extent (padded) so
             # features at the map margin aren't excluded from the definition query.
+            #
+            # The cursor below reads through any definition query saved on this
+            # layer in the project, and the query it builds then replaces that
+            # one -- so a saved filter silently drops features from every map.
+            # Say so, since it is the likely reason appended features go undrawn.
+            saved_query = (layer.definitionQuery or "").strip()
+            if saved_query and log_fn:
+                log_fn(
+                    f"  Layer '{layer.name}' has a definition query saved in the project: "
+                    f"{saved_query!r} — appended features it excludes are not drawn"
+                )
             try:
                 sr = arcpy.Describe(layer.dataSource).spatialReference
                 ext_poly = arcpy.Polygon(
@@ -895,6 +906,36 @@ def export_today():
     return date.today().strftime("%B %d, %Y")
 
 
+def _clear_layer_selections(arcpy, map_obj):
+    """Clear selections on the map's layers -- but only layers that have one.
+
+    The old loop ran SelectLayerByAttribute(CLEAR_SELECTION) on every layer in
+    the project: one geoprocessing call each, ~50s per map measured on
+    2026-11-17, half of every export.  This process opens a fresh copy of the
+    project, so a selection is normally there only if one was saved with it.
+    getSelectionSet() is a plain property read, so asking first is free.
+
+    A layer that cannot report its selection is cleared anyway, as before.
+    Returns how many layers were cleared.
+    """
+    cleared = 0
+    for layer in map_obj.listLayers():
+        if layer.isGroupLayer or not getattr(layer, "isFeatureLayer", True):
+            continue
+        try:
+            has_selection = bool(layer.getSelectionSet())
+        except Exception:
+            has_selection = True
+        if not has_selection:
+            continue
+        try:
+            arcpy.management.SelectLayerByAttribute(layer, "CLEAR_SELECTION")
+            cleared += 1
+        except Exception:
+            pass
+    return cleared
+
+
 class _Stopwatch:
     """Times the parts of one map export, logged as a single line.
 
@@ -945,12 +986,9 @@ def export_hfml_map(arcpy, hfml, config, today, observations_map, log_fn):
 
         # Clear any selections carried over from the user's ArcGIS Pro session
         with watch.part("clear selections"):
-            for _lyr in map_obj.listLayers():
-                if not _lyr.isGroupLayer:
-                    try:
-                        arcpy.management.SelectLayerByAttribute(_lyr, "CLEAR_SELECTION")
-                    except Exception:
-                        pass
+            cleared = _clear_layer_selections(arcpy, map_obj)
+        if cleared:
+            log_fn(f"  Cleared selections left on {cleared} layer(s) in the project")
 
         with watch.part("layout and camera"):
             layout = _get_layout(aprx, layout_name)

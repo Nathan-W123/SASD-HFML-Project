@@ -146,16 +146,37 @@ schema changes at all:
   (`_ends_near_lines`) instead of building point feature classes to select by;
 - the feature layers it selects on are made once per run (`_LayerPool`) and
   deleted once, instead of five to seven per HFML;
-- selections are read from the selection set itself (`_selected_oids`), never
-  through `GetCount` or a cursor on a layer, both of which treat an empty
-  selection as "every feature".
+- selections are read from the selection set itself (`_selected_oids`) rather
+  than by making a new layer from a selected one — a tool given a layer with an
+  empty selection uses every feature, so when no lateral was near a trace the
+  old code built its scratch endpoint table from all ~325,000 laterals.
 
-That last point was a latent bug: when no lateral was near a trace, the old
-code's empty selection widened to the whole lateral layer and every lateral in
-the dataset was selected. It had not fired because every HFML so far had
-laterals nearby.
+Per HFML this takes the schema-changing calls from 19 to 0. Measured on
+2026-11-17 the two select steps went from 455s to 4.4s a run, and Phase 4
+from 1014s to 506s.
 
-Per HFML this takes the schema-changing calls from 19 to 0. The rewrite was
+The map export was then three quarters of what remained, and timing inside it
+showed 50s of every ~70s map was clearing selections — a geoprocessing call on
+every layer in the project, though the export opens a fresh copy of the project
+in its own process where nothing is normally selected. It now asks each layer
+whether it has a selection first (a property read) and clears only those.
+
+### Appended features that are not drawn
+
+The export narrows each trace layer to the map view by reading the layer and
+replacing its definition query with a list of IDs. That read goes through any
+definition query saved on the layer in the project, so a saved filter — on
+lateral status or type, say — silently removes appended features from every
+map. It explains features going undrawn with no geometry or coordinate-system
+problem, and two layers on the same dataset drawing different counts. The
+export now logs any saved query it replaces:
+
+```
+Layer 'Lower_Laterals' has a definition query saved in the project: '...' — appended features it excludes are not drawn
+```
+
+Whether those features should show is a decision about the template, not the
+code: remove or change the saved query in the project if they should. The rewrite was
 checked against the previous implementation on 300 generated networks covering
 the edge cases — ends at exactly the search distance, laterals crossing a main
 mid-span, laterals tied in only at the downstream manhole, parcels on shared
