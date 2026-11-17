@@ -48,6 +48,30 @@ The pipeline runs inside ArcGIS Pro's Python environment, which needs `pyodbc`, 
 
 Edits to the backend scripts — including helper modules such as `backend/phase4/network_cache.py` — take effect on the next run without restarting Pro: the toolbox reloads them at the start of every run. After editing `SASD_HFML.pyt` itself, right-click the toolbox and choose **Refresh**.
 
+## Tests
+
+```
+python tests/run_all.py          # ~70s
+python tests/run_all.py --slow   # also proves the comparison test can fail (~4 min more)
+```
+
+No ArcGIS needed: `tests/stub_arcpy.py` stands in for arcpy with real 2D
+geometry and arcpy's selection rules. Any Python 3.9+ works, including ArcGIS
+Pro's. Each test is a plain script ending in a `FAILURES:` line.
+
+The comparison tests (`test_equivalence`, `test_status_and_appends`,
+`test_trace_status`) run the current code and the code from before the
+lateral/parcel rewrite on the same generated sewer networks and require
+identical results. The old code is read from git history (`tests/baseline.py`),
+so those tests need the git clone; on a copy without `.git` they skip.
+
+The stand-in is a model of arcpy, not arcpy. The tests show the new code
+matches the old under its rules; the real runs are what confirm the rules. One
+rule was wrong at first — whether a cursor on a layer with an empty selection
+returns everything or nothing — and was corrected from a real run's log.
+
+`deploy.bat` does not copy `tests\` to the shared folder.
+
 ## Phase 4 caching
 
 Phase 4 used to rebuild its directed pipe network once per HFML, each time
@@ -308,7 +332,8 @@ The first line is a dry run (`/L`) that writes nothing and lists what would
 change — always worth doing first. The second performs the copy.
 
 What it copies: only the files this project tracks (`SASD_HFML.pyt`,
-`backend\`, `config_loader.py`, `docs\`, `requirements.txt`, `README.md`).
+`backend\`, `config_loader.py`, `docs\`, `requirements.txt`, `README.md`),
+except `tests\`.
 `data\`, `PDF_Output\`, `Temp GIS Maps\`, geodatabases and anything else
 already sitting in the destination are never touched, and the script never
 deletes anything — files in the destination that the project no longer has are

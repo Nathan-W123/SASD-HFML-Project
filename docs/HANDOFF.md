@@ -23,9 +23,11 @@ requirements.txt — pip dependencies
 - `backend/phase4/run.py` — skeleton: loop over added HFMLs, recursive upstream ML trace, append MLs → select contacting LLs → append LLs → select intersecting parcels → append parcels
 - `backend/phase5/run.py` — skeleton: aspect ratio template selection, arcpy.mp PDF export loop. Element/layer names stubbed with TODOs.
 
-**Prototype scripts (reference only)**
-- `backend/phase1/SASD HFML Querying GIS import.py` — original Phase 1 prototype
-- `backend/phase4/SASD HFML Mainline Append.py` — original Phase 4 prototype
+**Prototype scripts** — removed 2026-11-17. `SASD HFML Querying GIS import.py`
+(Phase 1) and `SASD HFML Mainline Append.py` (Phase 4) were the original
+standalone scripts the phases replaced; nothing imported them. Recover either
+with `git show 1cfee6f:"backend/phase1/SASD HFML Querying GIS import.py"` (or
+the Phase 4 path) if ever needed.
 
 ## How to run
 

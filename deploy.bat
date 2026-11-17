@@ -8,7 +8,7 @@ rem    deploy.bat "<destination>" /L           dry run, shows what would copy
 rem    deploy.bat "<destination>" /CONFIG      also copy config.json
 rem    deploy.bat "<destination>" /Y           skip the "Pro closed?" prompt
 rem
-rem  Only files the project tracks are copied. data\, PDF_Output\,
+rem  Only files the project tracks are copied, except tests\. data\, PDF_Output\,
 rem  Temp GIS Maps\, geodatabases and anything else already in the
 rem  destination are never touched and never deleted.
 rem
@@ -149,6 +149,8 @@ rem ===========================================================================
 set "REL=%~1"
 if "%REL%"=="" goto :eof
 set "REL=%REL:/=\%"
+rem Tests run on a machine with the clone; the shared copy has no use for them.
+if /i "%REL:~0,6%"=="tests\" goto :eof
 if /i "%REL%"=="config.json" if not defined WITHCONFIG (
   set "SKIPPED=1"
   goto :eof
