@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import time
 import traceback
+from contextlib import contextmanager
 from datetime import date, datetime
 
 import pyodbc
@@ -894,91 +895,131 @@ def export_today():
     return date.today().strftime("%B %d, %Y")
 
 
+class _Stopwatch:
+    """Times the parts of one map export, logged as a single line.
+
+    The export is ~40% of Phase 4 (about 80s a map) and nothing inside it was
+    timed.  Read-only.
+    """
+
+    def __init__(self):
+        self.parts = []
+
+    @contextmanager
+    def part(self, label):
+        started = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.parts.append((label, time.perf_counter() - started))
+
+    def summary(self):
+        ordered = sorted(self.parts, key=lambda item: -item[1])
+        return ", ".join(f"{label} {seconds:.1f}s" for label, seconds in ordered)
+
+
 def export_hfml_map(arcpy, hfml, config, today, observations_map, log_fn):
     """Export the PDF map for one HFML.  Called by Phase 4 right after the
     HFML's features are appended, before they are cleaned back out."""
     hfml_id = str(hfml["pmnum"])
-    extent, target_point, hfml_extent = _get_phase4_feature_info(arcpy, hfml, config, log_fn)
-    layout_name, orientation = _select_template(extent, config)
-    log_fn(f"Selected {orientation} layout for HFML {hfml_id}")
-
-    pdf_path = hfml["pdf_path"]
-    draft_aprx_path = hfml["draft_aprx_path"]
-    os.makedirs(os.path.dirname(pdf_path), exist_ok=True)
-    aprx_src = hfml.get("aprx_path") or resolve_project_path(config, log_fn)
-    tmp_aprx = _working_aprx_path(aprx_src, hfml_id)
-    shutil.copy(aprx_src, tmp_aprx)
-
+    watch = _Stopwatch()
+    aprx = None
+    tmp_aprx = None
     try:
-        aprx = arcpy.mp.ArcGISProject(tmp_aprx)
-        map_obj = _get_map(aprx)
+        with watch.part("feature extents"):
+            extent, target_point, hfml_extent = _get_phase4_feature_info(arcpy, hfml, config, log_fn)
+        layout_name, orientation = _select_template(extent, config)
+        log_fn(f"Selected {orientation} layout for HFML {hfml_id}")
+
+        pdf_path = hfml["pdf_path"]
+        draft_aprx_path = hfml["draft_aprx_path"]
+        os.makedirs(os.path.dirname(pdf_path), exist_ok=True)
+        aprx_src = hfml.get("aprx_path") or resolve_project_path(config, log_fn)
+        tmp_aprx = _working_aprx_path(aprx_src, hfml_id)
+        with watch.part("copy project"):
+            shutil.copy(aprx_src, tmp_aprx)
+
+        with watch.part("open project"):
+            aprx = arcpy.mp.ArcGISProject(tmp_aprx)
+            map_obj = _get_map(aprx)
 
         # Clear any selections carried over from the user's ArcGIS Pro session
-        for _lyr in map_obj.listLayers():
-            if not _lyr.isGroupLayer:
-                try:
-                    arcpy.management.SelectLayerByAttribute(_lyr, "CLEAR_SELECTION")
-                except Exception:
-                    pass
+        with watch.part("clear selections"):
+            for _lyr in map_obj.listLayers():
+                if not _lyr.isGroupLayer:
+                    try:
+                        arcpy.management.SelectLayerByAttribute(_lyr, "CLEAR_SELECTION")
+                    except Exception:
+                        pass
 
-        layout = _get_layout(aprx, layout_name)
-        map_frame = _get_single(layout.listElements("MAPFRAME_ELEMENT"), MAP_FRAME_NAME, "map frame")
-        map_frame.map = map_obj
+        with watch.part("layout and camera"):
+            layout = _get_layout(aprx, layout_name)
+            map_frame = _get_single(layout.listElements("MAPFRAME_ELEMENT"), MAP_FRAME_NAME, "map frame")
+            map_frame.map = map_obj
 
-        # Set the camera first so we can pass the padded camera extent to
-        # _scope_layers — using the unpadded content extent would exclude features
-        # that are visible at the map margin from the trace layer definition queries.
-        map_obj.referenceScale = 0  # disable scale-dependent symbol sizing
-        _apply_camera_extent(arcpy, map_frame, extent, log_fn)
-        camera_extent = map_frame.camera.getExtent()
+            # Set the camera first so we can pass the padded camera extent to
+            # _scope_layers — using the unpadded content extent would exclude features
+            # that are visible at the map margin from the trace layer definition queries.
+            map_obj.referenceScale = 0  # disable scale-dependent symbol sizing
+            _apply_camera_extent(arcpy, map_frame, extent, log_fn)
+            camera_extent = map_frame.camera.getExtent()
         try:
             map_sr = map_obj.spatialReference
             log_fn(f"  Map coordinate system: {map_sr.name} (WKID {map_sr.factoryCode})")
         except Exception:
             pass
-        _scope_layers(arcpy, map_obj, hfml_id, camera_extent, log_fn)
-        _log_layer_report(arcpy, map_obj, hfml_id, config, log_fn, hfml=hfml)
-        _report_offscreen_features(arcpy, hfml, config, camera_extent, log_fn)
-        gridno = _lookup_gridno(arcpy, config, hfml_id)
-        _set_text_elements(layout, hfml_id, gridno, today, log_fn)
-        _try_add_callout(
-            layout,
-            map_frame,
-            extent,
-            target_point,
-            _get_callout_text(arcpy, config, hfml_id, observations_map.get(hfml_id, ""), log_fn, gridno=gridno),
-            log_fn,
-            hfml_extent=hfml_extent,
-        )
+        with watch.part("scope layers"):
+            _scope_layers(arcpy, map_obj, hfml_id, camera_extent, log_fn)
+        with watch.part("layer report"):
+            _log_layer_report(arcpy, map_obj, hfml_id, config, log_fn, hfml=hfml)
+        with watch.part("offscreen check"):
+            _report_offscreen_features(arcpy, hfml, config, camera_extent, log_fn)
+        with watch.part("text and callout"):
+            gridno = _lookup_gridno(arcpy, config, hfml_id)
+            _set_text_elements(layout, hfml_id, gridno, today, log_fn)
+            _try_add_callout(
+                layout,
+                map_frame,
+                extent,
+                target_point,
+                _get_callout_text(arcpy, config, hfml_id, observations_map.get(hfml_id, ""), log_fn, gridno=gridno),
+                log_fn,
+                hfml_extent=hfml_extent,
+            )
 
-        if os.path.exists(pdf_path):
-            try:
-                os.remove(pdf_path)
-            except Exception:
-                pass
-        layout.exportToPDF(pdf_path)
+        with watch.part("export PDF"):
+            if os.path.exists(pdf_path):
+                try:
+                    os.remove(pdf_path)
+                except Exception:
+                    pass
+            layout.exportToPDF(pdf_path)
         log_fn(f"Exported map for HFML {hfml_id} -> {pdf_path}")
 
         # Keep the finished map (camera, definition queries, callout) as a draft
         # project so it can be opened and adjusted later.
-        try:
-            os.makedirs(os.path.dirname(draft_aprx_path), exist_ok=True)
-            if os.path.exists(draft_aprx_path):
-                os.remove(draft_aprx_path)
-            aprx.saveACopy(draft_aprx_path)
-            log_fn(f"Saved GIS map for HFML {hfml_id} -> {draft_aprx_path}")
-        except Exception as exc:
-            log_fn(f"  WARNING: could not save GIS map for HFML {hfml_id} — {exc}")
+        with watch.part("save project copy"):
+            try:
+                os.makedirs(os.path.dirname(draft_aprx_path), exist_ok=True)
+                if os.path.exists(draft_aprx_path):
+                    os.remove(draft_aprx_path)
+                aprx.saveACopy(draft_aprx_path)
+                log_fn(f"Saved GIS map for HFML {hfml_id} -> {draft_aprx_path}")
+            except Exception as exc:
+                log_fn(f"  WARNING: could not save GIS map for HFML {hfml_id} — {exc}")
         return pdf_path
     finally:
+        if watch.parts:
+            log_fn(f"  Inside the export: {watch.summary()}")
         try:
             del aprx
         except Exception:
             pass
-        try:
-            os.remove(tmp_aprx)
-        except Exception:
-            pass
+        if tmp_aprx:
+            try:
+                os.remove(tmp_aprx)
+            except Exception:
+                pass
 
 
 def _python_exe():

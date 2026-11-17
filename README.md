@@ -136,9 +136,31 @@ switch off history logging, metadata logging and adding outputs to the map for
 their duration, restoring the previous settings afterwards. The log line
 `Geoprocessing bookkeeping off for this phase` confirms which were switched.
 
-If that does not bring the per-call cost down, the remaining fix is structural:
-the scratch endpoint feature classes exist only to run a one-foot distance test,
-which plain Python geometry can do with no tool calls at all.
+It did not (2026-11-17: logging confirmed off, per-call cost unchanged). The
+split that held across every run is that schema-changing tools — create a
+feature class, add a field, delete — cost 3–6s each, while selections and cursor
+reads cost almost nothing. So the lateral and parcel selection no longer makes
+schema changes at all:
+
+- the one-foot endpoint test runs on geometry objects in Python
+  (`_ends_near_lines`) instead of building point feature classes to select by;
+- the feature layers it selects on are made once per run (`_LayerPool`) and
+  deleted once, instead of five to seven per HFML;
+- selections are read from the selection set itself (`_selected_oids`), never
+  through `GetCount` or a cursor on a layer, both of which treat an empty
+  selection as "every feature".
+
+That last point was a latent bug: when no lateral was near a trace, the old
+code's empty selection widened to the whole lateral layer and every lateral in
+the dataset was selected. It had not fired because every HFML so far had
+laterals nearby.
+
+Per HFML this takes the schema-changing calls from 19 to 0. The rewrite was
+checked against the previous implementation on 300 generated networks covering
+the edge cases — ends at exactly the search distance, laterals crossing a main
+mid-span, laterals tied in only at the downstream manhole, parcels on shared
+edges, ends just outside any parcel — and selected identical laterals and
+parcels with identical log lines.
 
 Interpreter startup turned out to be negligible: of 68s per export, 5.5s was
 importing arcpy and 61s was building and exporting the map, leaving about 2s of

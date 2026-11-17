@@ -177,10 +177,9 @@ _SCRATCH_WORKSPACE = {}
 def _scratch_workspace(arcpy, log_fn=None):
     """Which in-memory workspace scratch feature classes go in.
 
-    'memory' is the modern workspace and is markedly faster than the legacy
-    'in_memory' for the create / add-field / delete cycle this code runs twice
-    per HFML -- which measured at ~17s per call regardless of how many features
-    were involved, i.e. fixed tool overhead rather than data work.
+    Only the per-HFML fallback network build uses scratch feature classes now;
+    the lateral and parcel tests that used to build them twice per HFML run in
+    Python instead (see _ends_near_lines).
 
     Probed once per process, falling back to 'in_memory' so an environment
     without it still works.
@@ -917,125 +916,205 @@ def _write_phase4_map_manifest(hfml_records, log_fn):
     log_fn(f"Phase 4 map manifest written: {PHASE4_MAP_OUTPUT_PATH}")
 
 
-def _build_ll_endpoint_table(arcpy, ll_layer, output_name="_TmpLLEndpoints", timer=None):
-    timer = timer or _NullTimer()
-    workspace = _scratch_workspace(arcpy)
-    output_path = f"{workspace}\\{output_name}"
+# The endpoint tests below used to build scratch point feature classes, run a
+# select-by-location over them, then delete everything again -- for every HFML.
+# Timed per tool call (2026-11-17) those schema operations cost 3-6s each
+# however little data they held: ~75s of every HFML.  Selections and cursor
+# reads cost ~0.  So the selections stay, the scratch feature classes go, and
+# the one-foot endpoint test runs on geometry objects in Python instead.
 
-    with timer.substep("endpoint table: describe source"):
-        if arcpy.Exists(output_path):
-            arcpy.management.Delete(output_path)
-        ll_desc = arcpy.Describe(ll_layer)
-        spatial_ref = ll_desc.spatialReference
+LL_SEARCH_FEET = 1.0
+# Spatial selections are evaluated with the data's XY tolerance (~0.001 ft for
+# these State Plane feet layers), so a point a hair past the search distance
+# can still count.  Matching that keeps the Python test from being stricter
+# than the select it replaces.
+_DISTANCE_TOLERANCE = 0.001
+# Rows per OBJECTID IN (...) clause.  Long lists are split rather than sent as
+# one query that a geodatabase can refuse.
+_OID_CHUNK = 900
 
-    with timer.substep("endpoint table: create and add fields"):
-        arcpy.management.CreateFeatureclass(workspace, output_name, "POINT", spatial_reference=spatial_ref)
-        arcpy.management.AddField(output_path, "LL_OID", "LONG")
-        arcpy.management.AddField(output_path, "END_ID", "LONG")
 
-    end_id = 1
-    with timer.substep("endpoint table: insert rows"), \
-            arcpy.da.InsertCursor(output_path, ["SHAPE@", "LL_OID", "END_ID"]) as insert_cursor:
-        with arcpy.da.SearchCursor(ll_layer, ["OBJECTID", "SHAPE@"]) as search_cursor:
-            for ll_oid, geom in search_cursor:
-                if geom is None:
+def _chunks(values, size=_OID_CHUNK):
+    values = list(values)
+    for i in range(0, len(values), size):
+        yield values[i:i + size]
+
+
+def _oid_where(oids):
+    return f"OBJECTID IN ({','.join(str(int(oid)) for oid in oids)})"
+
+
+def _read_geometries(arcpy, source, oids):
+    """{oid: geometry} for these OIDs, straight from the dataset.
+
+    Reads the dataset by path, never through a layer, so an empty selection
+    can't silently widen the read to every feature.
+    """
+    out = {}
+    for chunk in _chunks(sorted(set(oids))):
+        with arcpy.da.SearchCursor(source, ["OID@", "SHAPE@"], _oid_where(chunk)) as cursor:
+            for oid, geom in cursor:
+                if geom is not None:
+                    out[oid] = geom
+    return out
+
+
+def _selected_oids(arcpy, layer):
+    """OIDs currently selected on a layer.
+
+    Read from the selection set itself.  GetCount and cursors treat an empty
+    selection as "no selection" and return every feature, which on a 300,000-
+    feature layer would be both wrong and very slow.
+    """
+    fid_set = arcpy.Describe(layer).FIDSet or ""
+    return {int(part) for part in fid_set.replace(",", ";").split(";") if part.strip()}
+
+
+def _select_by_oids(arcpy, layer, oids):
+    """Select exactly these OIDs on a layer, in chunks.  Never call with none:
+    an empty selection means "all features" to every tool that reads it."""
+    oids = sorted(set(oids))
+    if not oids:
+        raise ValueError("_select_by_oids needs at least one OID")
+    for i, chunk in enumerate(_chunks(oids)):
+        arcpy.management.SelectLayerByAttribute(
+            layer, "NEW_SELECTION" if i == 0 else "ADD_TO_SELECTION", _oid_where(chunk)
+        )
+
+
+def _endpoints(geom):
+    """(x, y) of a line's two ends, as the old endpoint table recorded them."""
+    out = []
+    for point in (geom.firstPoint, geom.lastPoint):
+        if point is not None:
+            out.append((point.X, point.Y))
+    return out
+
+
+def _ends_near_lines(candidates, lines, distance, make_point):
+    """For each candidate line, the ends that lie within `distance` of any of `lines`.
+
+    candidates: {oid: geometry}; lines: [geometry].  Returns {oid: [(x, y), ...]}
+    for candidates with at least one such end.  This is what building an
+    endpoint feature class and selecting it WITHIN_A_DISTANCE of the lines
+    computed, without any geoprocessing tools.
+    """
+    limit = distance + _DISTANCE_TOLERANCE
+    boxes = [(line, line.extent) for line in lines]
+    hits = {}
+    for oid, geom in candidates.items():
+        for x, y in _endpoints(geom):
+            point = None
+            for line, ext in boxes:
+                if not (ext.XMin - limit <= x <= ext.XMax + limit
+                        and ext.YMin - limit <= y <= ext.YMax + limit):
                     continue
-                if geom.firstPoint is not None:
-                    insert_cursor.insertRow([arcpy.PointGeometry(geom.firstPoint, spatial_ref), ll_oid, end_id])
-                    end_id += 1
-                if geom.lastPoint is not None:
-                    insert_cursor.insertRow([arcpy.PointGeometry(geom.lastPoint, spatial_ref), ll_oid, end_id])
-                    end_id += 1
-
-    return output_path
+                if point is None:
+                    point = make_point(x, y)
+                if line.distanceTo(point) <= limit:
+                    hits.setdefault(oid, []).append((x, y))
+                    break
+    return hits
 
 
-def _get_count(arcpy, layer_or_table):
-    return int(arcpy.management.GetCount(layer_or_table)[0])
+def _point_maker(arcpy, like_geom):
+    sr = getattr(like_geom, "spatialReference", None)
+    return lambda x, y: arcpy.PointGeometry(arcpy.Point(x, y), sr)
+
+
+class _LayerPool:
+    """Feature layers made once per run and reused for every HFML.
+
+    Making a layer is cheap, but each Delete measured ~3s, and the old code
+    made and deleted five to seven layers per HFML.  Every use replaces the
+    layer's selection, so nothing carries over from one HFML to the next.
+    """
+
+    def __init__(self, arcpy):
+        self.arcpy = arcpy
+        self._layers = {}
+
+    def layer(self, key, source):
+        name = f"_HFMLPool_{key}"
+        entry = self._layers.get(key)
+        if entry is not None and entry == source:
+            return name
+        _replace_temp_layer(self.arcpy, name, source)
+        self._layers[key] = source
+        return name
+
+    def close(self):
+        for key in list(self._layers):
+            name = f"_HFMLPool_{key}"
+            try:
+                if self.arcpy.Exists(name):
+                    self.arcpy.management.Delete(name)
+            except Exception:
+                pass
+        self._layers.clear()
+
+
+@contextmanager
+def _layer_pool(arcpy):
+    pool = _LayerPool(arcpy)
+    try:
+        yield pool
+    finally:
+        pool.close()
 
 
 def _select_lls_contacting_mls(
-    arcpy, ml_oid_list, ml_source, ll_source, seed_ml_layer=None, downstream_point=None, log_fn=None,
-    timer=None,
+    arcpy, ml_oid_list, ml_source, ll_source, downstream_point=None, log_fn=None,
+    timer=None, layers=None,
 ):
-    if not ml_oid_list and seed_ml_layer is None:
+    """Laterals with an end within LL_SEARCH_FEET of a traced main.
+
+    One select-by-location narrows 300,000+ laterals to the few near the trace;
+    the endpoint test then runs on their geometry in Python.
+    """
+    if not ml_oid_list:
         return []
-
     timer = timer or _NullTimer()
-    ml_layer = None
-    with timer.substep("LL: open layers"):
-        if ml_oid_list:
-            query = f"OBJECTID IN ({','.join(map(str, ml_oid_list))})"
-            ml_layer = _replace_temp_layer(arcpy, "_TmpML", ml_source, query)
-        ll_layer = _replace_temp_layer(arcpy, "_TmpLL", ll_source)
-    candidate_ll_layer = None
-    endpoint_fc = None
-    endpoint_layer = None
+    own_pool = layers is None
+    pool = layers or _LayerPool(arcpy)
     try:
-        selection_made = False
-        # This is the one that scans the whole lateral layer, however few
-        # laterals end up selected.
-        with timer.substep("LL: select by location over the whole layer"):
-            if ml_layer is not None:
-                arcpy.management.SelectLayerByLocation(
-                    ll_layer,
-                    "WITHIN_A_DISTANCE",
-                    ml_layer,
-                    search_distance=LL_SEARCH_DISTANCE,
-                    selection_type="NEW_SELECTION",
-                )
-                selection_made = True
-            if seed_ml_layer is not None:
-                arcpy.management.SelectLayerByLocation(
-                    ll_layer,
-                    "WITHIN_A_DISTANCE",
-                    seed_ml_layer,
-                    search_distance=LL_SEARCH_DISTANCE,
-                    selection_type="ADD_TO_SELECTION" if selection_made else "NEW_SELECTION",
-                )
-                selection_made = True
+        with timer.substep("LL: select laterals near the trace"):
+            ml_layer = pool.layer("ml", ml_source)
+            _select_by_oids(arcpy, ml_layer, ml_oid_list)
+            if not _selected_oids(arcpy, ml_layer):
+                return []
+            ll_layer = pool.layer("ll", ll_source)
+            arcpy.management.SelectLayerByLocation(
+                ll_layer,
+                "WITHIN_A_DISTANCE",
+                ml_layer,
+                search_distance=LL_SEARCH_DISTANCE,
+                selection_type="NEW_SELECTION",
+            )
+            candidate_oids = _selected_oids(arcpy, ll_layer)
 
-        if not selection_made:
+        if log_fn:
+            log_fn(f"Candidate LL count before endpoint filter: {len(candidate_oids)}")
+        if not candidate_oids:
+            if log_fn:
+                log_fn(f"LL endpoint hits after {LL_SEARCH_DISTANCE} filter: 0")
             return []
 
-        with timer.substep("LL: candidate layer and count"):
-            candidate_ll_layer = _replace_temp_layer(arcpy, "_TmpLLCandidates", ll_layer)
-            if log_fn:
-                log_fn(f"Candidate LL count before endpoint filter: {_get_count(arcpy, candidate_ll_layer)}")
+        with timer.substep("LL: read laterals and traced MLs"):
+            candidates = _read_geometries(arcpy, ll_source, candidate_oids)
+            mains = list(_read_geometries(arcpy, ml_source, ml_oid_list).values())
 
-        with timer.substep("LL: build endpoint table"):
-            endpoint_fc = _build_ll_endpoint_table(arcpy, candidate_ll_layer, timer=timer)
-            endpoint_layer = _replace_temp_layer(arcpy, "_TmpLLEndpointLayer", endpoint_fc)
-            arcpy.management.SelectLayerByAttribute(endpoint_layer, "CLEAR_SELECTION")
+        with timer.substep("LL: endpoint test (Python)"):
+            hits = (
+                _ends_near_lines(candidates, mains, LL_SEARCH_FEET, _point_maker(arcpy, mains[0]))
+                if mains else {}
+            )
 
-        with timer.substep("LL: endpoint select"):
-            endpoint_selection_made = False
-            if ml_layer is not None:
-                arcpy.management.SelectLayerByLocation(
-                    endpoint_layer,
-                    "WITHIN_A_DISTANCE",
-                    ml_layer,
-                    search_distance=LL_SEARCH_DISTANCE,
-                    selection_type="NEW_SELECTION",
-                )
-                endpoint_selection_made = True
-            if seed_ml_layer is not None:
-                arcpy.management.SelectLayerByLocation(
-                    endpoint_layer,
-                    "WITHIN_A_DISTANCE",
-                    seed_ml_layer,
-                    search_distance=LL_SEARCH_DISTANCE,
-                    selection_type="ADD_TO_SELECTION" if endpoint_selection_made else "NEW_SELECTION",
-                )
-
-            if log_fn:
-                log_fn(f"LL endpoint hits after {LL_SEARCH_DISTANCE} filter: {_get_count(arcpy, endpoint_layer)}")
-
-        with timer.substep("LL: read endpoint hits"):
-            hits = {}
-            with arcpy.da.SearchCursor(endpoint_layer, ["LL_OID", "SHAPE@XY"]) as cursor:
-                for ll_oid, (x, y) in cursor:
-                    hits.setdefault(ll_oid, []).append((x, y))
+        if log_fn:
+            log_fn(
+                f"LL endpoint hits after {LL_SEARCH_DISTANCE} filter: "
+                f"{sum(len(points) for points in hits.values())}"
+            )
 
         # An LL whose only contact with the traced MLs is the HFML's downstream
         # manhole drains downstream of the HFML, so it is not part of the trace.
@@ -1052,43 +1131,8 @@ def _select_lls_contacting_mls(
 
         return sorted(hits)
     finally:
-        with timer.substep("LL: delete scratch layers"):
-            if ml_layer is not None and arcpy.Exists(ml_layer):
-                arcpy.management.Delete(ml_layer)
-            if arcpy.Exists(ll_layer):
-                arcpy.management.Delete(ll_layer)
-            if candidate_ll_layer is not None and arcpy.Exists(candidate_ll_layer):
-                arcpy.management.Delete(candidate_ll_layer)
-            if endpoint_layer is not None and arcpy.Exists(endpoint_layer):
-                arcpy.management.Delete(endpoint_layer)
-            if endpoint_fc is not None and arcpy.Exists(endpoint_fc):
-                arcpy.management.Delete(endpoint_fc)
-
-
-
-
-def _copy_endpoint_subset(arcpy, source_layer, endpoint_ids, output_name="_TmpParcelSideEndpoints",
-                         timer=None):
-    timer = timer or _NullTimer()
-    workspace = _scratch_workspace(arcpy)
-    output_path = f"{workspace}\\{output_name}"
-
-    with timer.substep("endpoint subset: create"):
-        if arcpy.Exists(output_path):
-            arcpy.management.Delete(output_path)
-        source_desc = arcpy.Describe(source_layer)
-        spatial_ref = source_desc.spatialReference
-        arcpy.management.CreateFeatureclass(workspace, output_name, "POINT", spatial_reference=spatial_ref)
-
-    endpoint_id_set = set(endpoint_ids)
-    with timer.substep("endpoint subset: insert rows"), \
-            arcpy.da.InsertCursor(output_path, ["SHAPE@"]) as insert_cursor:
-        with arcpy.da.SearchCursor(source_layer, ["SHAPE@", "END_ID"]) as search_cursor:
-            for geom, end_id in search_cursor:
-                if end_id in endpoint_id_set:
-                    insert_cursor.insertRow([geom])
-
-    return output_path
+        if own_pool:
+            pool.close()
 
 
 def _select_parcels_intersecting_lls(
@@ -1098,121 +1142,83 @@ def _select_parcels_intersecting_lls(
     parcels_source,
     ml_oid_list=None,
     ml_source=None,
-    seed_ml_layer=None,
     log_fn=None,
     timer=None,
+    layers=None,
 ):
+    """The parcel each selected lateral serves.
+
+    Each lateral's parcel-side end -- the end away from the main -- takes the
+    parcel(s) it lies in or on (a shared edge gives both); an end in no parcel
+    takes the nearest one within PARCEL_SEARCH_FEET.
+    """
     if not ll_oid_list:
         return []
     timer = timer or _NullTimer()
-    with timer.substep("parcels: open layers"):
-        query = f"OBJECTID IN ({','.join(map(str, ll_oid_list))})"
-        ll_layer = _replace_temp_layer(arcpy, "_TmpLL", ll_source, query)
-        parcels_layer = _replace_temp_layer(arcpy, "_TmpParcels", parcels_source)
-    ml_layer = None
-    endpoint_fc = None
-    endpoint_layer = None
-    parcel_endpoint_fc = None
-    parcel_endpoint_layer = None
+    own_pool = layers is None
+    pool = layers or _LayerPool(arcpy)
     try:
-        with timer.substep("parcels: build LL endpoint table"):
-            endpoint_fc = _build_ll_endpoint_table(
-                arcpy, ll_layer, "_TmpParcelLLEndpoints", timer=timer
+        with timer.substep("parcels: read laterals and traced MLs"):
+            laterals = _read_geometries(arcpy, ll_source, ll_oid_list)
+            mains = (
+                list(_read_geometries(arcpy, ml_source, ml_oid_list).values())
+                if ml_oid_list and ml_source else []
             )
-            endpoint_layer = _replace_temp_layer(arcpy, "_TmpParcelLLEndpointLayer", endpoint_fc)
-
-        # Build per-LL endpoint mapping before any selection is active.
-        ll_to_end_ids = {}
-        endpoint_ids  = set()
-        with arcpy.da.SearchCursor(endpoint_layer, ["END_ID", "LL_OID"]) as _cur:
-            for _end_id, _ll_oid in _cur:
-                endpoint_ids.add(_end_id)
-                ll_to_end_ids.setdefault(_ll_oid, []).append(_end_id)
-        ml_endpoint_ids = set()
-        selection_made = False
-
-        with timer.substep("parcels: classify LL ends against MLs"):
-            if ml_oid_list and ml_source:
-                ml_query = f"OBJECTID IN ({','.join(map(str, ml_oid_list))})"
-                ml_layer = _replace_temp_layer(arcpy, "_TmpParcelML", ml_source, ml_query)
-                arcpy.management.SelectLayerByLocation(
-                    endpoint_layer,
-                    "WITHIN_A_DISTANCE",
-                    ml_layer,
-                    search_distance=LL_SEARCH_DISTANCE,
-                    selection_type="NEW_SELECTION",
-                )
-                selection_made = True
-
-            if seed_ml_layer is not None:
-                arcpy.management.SelectLayerByLocation(
-                    endpoint_layer,
-                    "WITHIN_A_DISTANCE",
-                    seed_ml_layer,
-                    search_distance=LL_SEARCH_DISTANCE,
-                    selection_type="ADD_TO_SELECTION" if selection_made else "NEW_SELECTION",
-                )
-                selection_made = True
-
-            if selection_made:
-                ml_endpoint_ids = {row[0] for row in arcpy.da.SearchCursor(endpoint_layer, ["END_ID"])}
 
         # Per-LL classification: for each LL that has at least one ML-side
-        # endpoint, its parcel-side endpoint is the OTHER one.  Global set
-        # subtraction would incorrectly exclude parcel-side endpoints that
-        # happen to also lie on a ML boundary.
-        parcel_endpoint_ids = set()
-        for _ll_oid, _end_ids in ll_to_end_ids.items():
-            _ml_side     = [e for e in _end_ids if e in ml_endpoint_ids]
-            if not _ml_side:
-                continue  # LL has no ML connection — skip
-            _parcel_side = [e for e in _end_ids if e not in ml_endpoint_ids]
-            if _parcel_side:
-                parcel_endpoint_ids.update(_parcel_side)
-            else:
-                # Both endpoints are within ML search distance (very short LL).
-                # Include all and let the spatial parcel selection decide.
-                parcel_endpoint_ids.update(_end_ids)
-        if log_fn:
-            log_fn(f"LL parcel-side endpoint count: {len(parcel_endpoint_ids)}")
+        # end, its parcel-side end is the OTHER one.  Classifying per LL rather
+        # than by global set subtraction keeps a parcel-side end that happens
+        # to also lie on an ML boundary.
+        with timer.substep("parcels: classify LL ends (Python)"):
+            ml_side = _ends_near_lines(
+                laterals, mains, LL_SEARCH_FEET, _point_maker(arcpy, mains[0])
+            ) if mains else {}
+            parcel_points = []
+            for ll_oid in sorted(laterals):
+                ends = _endpoints(laterals[ll_oid])
+                near = ml_side.get(ll_oid)
+                if not near:
+                    continue  # LL has no ML connection — skip
+                parcel_side = [end for end in ends if end not in near]
+                # Both ends within ML search distance (very short LL): include
+                # both and let the parcel matching decide.
+                parcel_points.extend(parcel_side if parcel_side else ends)
 
-        if not parcel_endpoint_ids:
+        if log_fn:
+            log_fn(f"LL parcel-side endpoint count: {len(parcel_points)}")
+        if not parcel_points:
             return []
 
-        with timer.substep("parcels: parcel-side endpoint subset"):
-            arcpy.management.SelectLayerByAttribute(endpoint_layer, "CLEAR_SELECTION")
-            parcel_endpoint_fc = _copy_endpoint_subset(
-                arcpy, endpoint_layer, parcel_endpoint_ids, timer=timer
-            )
-            parcel_endpoint_layer = _replace_temp_layer(
-                arcpy,
-                "_TmpParcelSideEndpointLayer",
-                parcel_endpoint_fc,
-            )
-
-        # Each parcel-side end takes the parcel(s) it lies in or on (a shared
-        # edge gives both); an end that lies in no parcel takes the nearest one
-        # within PARCEL_SEARCH_FEET.
-        #
-        # This is the one that scans the whole parcels layer, however few
-        # parcels end up selected.
-        with timer.substep("parcels: select by location over the whole layer"):
+        # Candidates: parcels within PARCEL_SEARCH_FEET of the selected laterals
+        # anywhere along their length.  Every parcel near a parcel-side end is
+        # near its lateral, so this is a superset of what the old point-based
+        # select returned, and the exact per-end test below picks the same
+        # parcels from it -- without building a point feature class to select by.
+        with timer.substep("parcels: select parcels near the laterals"):
+            ll_layer = pool.layer("ll", ll_source)
+            _select_by_oids(arcpy, ll_layer, ll_oid_list)
+            parcels_layer = pool.layer("parcels", parcels_source)
             arcpy.management.SelectLayerByLocation(
-                parcels_layer, "WITHIN_A_DISTANCE", parcel_endpoint_layer,
+                parcels_layer, "WITHIN_A_DISTANCE", ll_layer,
                 search_distance=f"{PARCEL_SEARCH_FEET} Feet", selection_type="NEW_SELECTION",
             )
-        with timer.substep("parcels: read selected parcel geometry"):
-            with arcpy.da.SearchCursor(parcels_layer, ["OBJECTID", "SHAPE@"]) as cursor:
-                candidates = [(oid, geom, geom.extent) for oid, geom in cursor if geom is not None]
+            candidate_oids = _selected_oids(arcpy, parcels_layer)
+
+        with timer.substep("parcels: read candidate parcels"):
+            candidates = [
+                (oid, geom, geom.extent)
+                for oid, geom in sorted(_read_geometries(arcpy, parcels_source, candidate_oids).items())
+            ]
+
         chosen, nearest_used, unmatched = set(), [], 0
         tol = PARCEL_SEARCH_FEET
-        with timer.substep("parcels: match ends to parcels"), \
-                arcpy.da.SearchCursor(parcel_endpoint_layer, ["SHAPE@"]) as cursor:
-            for (end,) in cursor:
-                pt = end.firstPoint
+        with timer.substep("parcels: match ends to parcels"):
+            make_point = _point_maker(arcpy, candidates[0][1] if candidates else (mains[0] if mains else None))
+            for x, y in parcel_points:
+                end = make_point(x, y)
                 dists = sorted(
                     (geom.distanceTo(end), oid) for oid, geom, ext in candidates
-                    if ext.XMin - tol <= pt.X <= ext.XMax + tol and ext.YMin - tol <= pt.Y <= ext.YMax + tol
+                    if ext.XMin - tol <= x <= ext.XMax + tol and ext.YMin - tol <= y <= ext.YMax + tol
                 )
                 dists = [(d, oid) for d, oid in dists if d <= tol]
                 if not dists:
@@ -1231,21 +1237,8 @@ def _select_parcels_intersecting_lls(
             log_fn(f"  {unmatched} LL end(s) have no parcel within {tol:g} ft")
         return sorted(chosen)
     finally:
-        with timer.substep("parcels: delete scratch layers"):
-            if ml_layer is not None and arcpy.Exists(ml_layer):
-                arcpy.management.Delete(ml_layer)
-            if arcpy.Exists(ll_layer):
-                arcpy.management.Delete(ll_layer)
-            if arcpy.Exists(parcels_layer):
-                arcpy.management.Delete(parcels_layer)
-            if endpoint_layer is not None and arcpy.Exists(endpoint_layer):
-                arcpy.management.Delete(endpoint_layer)
-            if endpoint_fc is not None and arcpy.Exists(endpoint_fc):
-                arcpy.management.Delete(endpoint_fc)
-            if parcel_endpoint_layer is not None and arcpy.Exists(parcel_endpoint_layer):
-                arcpy.management.Delete(parcel_endpoint_layer)
-            if parcel_endpoint_fc is not None and arcpy.Exists(parcel_endpoint_fc):
-                arcpy.management.Delete(parcel_endpoint_fc)
+        if own_pool:
+            pool.close()
 
 
 def _append_seed_to_hfml_layer(arcpy, seed_oids, ml_source, hfml_layer, pmnum, pm_mainlines_path, log_fn):
@@ -1272,18 +1265,26 @@ def _append_seed_to_hfml_layer(arcpy, seed_oids, ml_source, hfml_layer, pmnum, p
     # seed so the layer's symbology classifies it.  HFML layer fields are matched
     # as PM_Mainlines_<field> (joined export naming) or a bare 'frequency'.
     layer_field_info = {f.name.lower(): f for f in arcpy.ListFields(hfml_layer)}
-    pm_values = {}
-    try:
+
+    # Phase 3 has just rewritten PM_Mainlines on the share, and the first read
+    # straight after can see a stale workspace ("PM_Mainlines does not exist",
+    # 2026-11-17).  _with_arcpy_retry clears the workspace cache and retries.
+    def _read_pm_values():
         pm_fields = [
             f.name for f in arcpy.ListFields(pm_mainlines_path)
             if f.type not in ("OID", "Geometry", "GlobalID", "Blob", "Raster")
         ]
         with arcpy.da.SearchCursor(pm_mainlines_path, pm_fields, f"pmnum = '{pmnum}'") as cur:
             for row in cur:
-                pm_values = dict(zip(pm_fields, row))
-                break
-    except Exception as exc:
-        log_fn(f"  WARNING: could not read PM_Mainlines attributes for pmnum {pmnum} — {exc}")
+                return dict(zip(pm_fields, row))
+        return {}
+
+    # If it still cannot be read, fail this HFML rather than map it without its
+    # attributes: a map that exports is marked done and never redone, while a
+    # failed HFML is rolled back and picked up again on the next run.
+    pm_values = _with_arcpy_retry(
+        arcpy, _read_pm_values, f"Reading PM_Mainlines attributes for pmnum {pmnum}"
+    )
 
     copies = {}
     for pm_field, value in pm_values.items():
@@ -1551,11 +1552,11 @@ def _setup_phase4_cache(arcpy, config, ml_source, log_fn):
 
 def run(log_fn):
     arcpy = _import_arcpy()
-    with _quiet_geoprocessing(arcpy, log_fn):
-        return _run(log_fn)
+    with _quiet_geoprocessing(arcpy, log_fn), _layer_pool(arcpy) as layer_pool:
+        return _run(log_fn, layer_pool=layer_pool)
 
 
-def _run(log_fn):
+def _run(log_fn, layer_pool=None):
     # Imported here: phase5 imports PHASE4_MAP_OUTPUT_PATH from this module.
     from backend.phase5.run import (
         export_hfml_map_out_of_process, find_mapped_pdfs, new_run_dir, resolve_project_path,
@@ -1775,6 +1776,7 @@ def _run(log_fn):
                 ll_oids = _select_lls_contacting_mls(
                     arcpy, ml_oids, ml_source, ll_source,
                     downstream_point=downstream_point, log_fn=log_fn, timer=timer,
+                    layers=layer_pool,
                 )
             log_fn(f"Selected LL count: {len(ll_oids)}")
             log_fn(f"Selected LL OID preview: {_preview_oids(ll_oids)}")
@@ -1786,6 +1788,7 @@ def _run(log_fn):
                 parcel_oids = _select_parcels_intersecting_lls(
                     arcpy, ll_oids, ll_source, parcels_source,
                     ml_oid_list=ml_oids, ml_source=ml_source, log_fn=log_fn, timer=timer,
+                    layers=layer_pool,
                 )
             log_fn(f"Selected parcel count: {len(parcel_oids)}")
             log_fn(f"Selected parcel OID preview: {_preview_oids(parcel_oids)}")
