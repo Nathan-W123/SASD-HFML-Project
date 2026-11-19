@@ -107,6 +107,7 @@ to `config.json` — these keys are optional and default to on:
 | `p4_ll_status_filter` | `"STATUS IN ('OPERATING', 'TOBEMOD')"` | only laterals matching this are selected, so their parcels follow; empty selects every status |
 | `p4_ml_status_filter` | `"STATUS = 'OPERATING'"` | the upstream trace only follows mains matching this; empty follows every main |
 | `p4_export_reuse_process` | `true` | export every map from one Python process; `false` starts one per map as before |
+| `p4_export_keep_project_open` | `true` | in that process, keep one copy of the map project open and reset it before each map; `false` opens a fresh copy per map as before |
 
 ### One effect on the maps
 
@@ -220,8 +221,8 @@ changes, each with a fallback to the previous behaviour:
 - **One export process for the run.** Layout export fails inside the ArcGIS
   Pro process, so maps are exported by a separate `python.exe` — previously one
   started per map. One process now serves every map, paying the arcpy import
-  once. Each map still opens its own fresh copy of the project and gets its own
-  copy of the config, so nothing carries from one map to the next. If the
+  once. Each map gets its own copy of the config, so one map's settings never
+  reach the next. If the
   process dies mid-map it is replaced and that map retried once; it is also
   replaced every 25 maps so memory cannot build up. `p4_export_reuse_process:
   false` restores one process per map.
@@ -238,7 +239,52 @@ changes, each with a fallback to the previous behaviour:
   source. Measured on 2026-11-19 this saved nothing: the 11–17s moved to "layout
   and camera", the next step to touch the layers. It is the cost of opening the
   map's ~32 layers over the network, paid again by every map because each map
-  opens its own copy of the project.
+  opens its own copy of the project. Since fixed — see "One open project" below.
+
+### One open project
+
+With every map opening its own fresh copy of the map project, 11–17s of each
+map went on opening the map's ~32 layers over the network (2026-11-19). The
+export process now keeps one copy open for the run (it is replaced every 25
+maps, with the process) and, before every map, puts back everything an export
+changes, so each map starts exactly as a fresh copy would:
+
+- the definition query, and any selection, of every layer the export filters
+  — the HFML layer and the trace layers. This part is essential: the export
+  reads those layers through their current query, so the previous map's query
+  would hide the new HFML and narrow the traces to the previous map's IDs;
+- every layout, whole, from its CIM — title, date, callout, arrow, map frame
+  — then checked: every text, graphic and map frame element must be back at
+  the template's text, position, size and visibility, or a fresh copy is
+  opened instead;
+- the map's reference scale.
+
+A previous map's features cannot reappear on a later one, nearby or not:
+Phase 4 deletes them after each map, and every filtered layer is narrowed to
+the new map's own object IDs, which are never reused.
+
+Checked on every map: once the layers are filtered, each one's drawn count is
+compared with what Phase 4 appended. On any difference the open copy is
+dropped and the map redone on a fresh copy, whose result stands as it always
+has. A fresh copy is also opened when the template file is saved mid-run, when
+the reset fails, and after a map fails. `TEST.aprx` itself is never written.
+The working copy is `_phase5_open_<computer>_<process>_<n>_tmp.aprx` next to
+the template, removed when the process ends. `p4_export_keep_project_open:
+false` opens a fresh copy for every map, as before.
+
+The log says which happened for each map:
+
+```
+  Map project: reusing the open copy (map 3 on it), reset to the template
+  Inside the export: export PDF 2.1s, scope layers 1.7s, reset project 0.2s, ...
+```
+
+Tested by exporting the same runs both ways on a stand-in project and
+comparing, map for map, every layout element and every layer's query,
+selection and drawn features — including maps next to earlier ones, a stale
+open copy, the template saved mid-run, a failed reset, a reset that silently
+did nothing, a failed map, a failed arrow and a selection left behind by the
+selection tools.
 
 ### Cache fingerprints
 

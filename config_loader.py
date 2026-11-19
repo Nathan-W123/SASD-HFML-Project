@@ -97,9 +97,15 @@ OPTIONAL_DEFAULTS = {
     # main regardless of status.
     "p4_ml_status_filter": "STATUS = 'OPERATING'",
     # Export every map in the run from one Python process instead of starting
-    # one per map (~7.5s each to start Python and import arcpy).  Each map still
-    # opens its own fresh copy of the project.  False restores one per map.
+    # one per map (~7.5s each to start Python and import arcpy).  False
+    # restores one per map.
     "p4_export_reuse_process": True,
+    # Within that process, keep one copy of the map project open and reset it
+    # to the template before each map, instead of opening a fresh copy per map
+    # (11-17s each, 2026-11-19).  A map whose layers draw a different count
+    # than Phase 4 appended is redone on a fresh copy.  False opens a fresh
+    # copy for every map, as before.
+    "p4_export_keep_project_open": True,
 }
 
 

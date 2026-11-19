@@ -78,6 +78,22 @@ try:
     check("repeated crash raises", raised and "stopped twice" in raised, raised)
     check("next map still works after giving up", w.export(job(9), scratch(9), lines.append) == job(9)["pdf_path"])
 
+    # a process killed while keeping a project copy open: its copy is removed
+    # once it has stopped; another process's copy in the same folder is not
+    others = P5._open_copy_path(os.path.join(d, "TEST.aprx"), 1, pid=999999)
+    open(others, "w").close()
+    lines.clear()
+    raised = None
+    try:
+        w.export(job(11, fake="keep_copy_and_crash"), scratch(11), lines.append)
+    except RuntimeError as exc:
+        raised = str(exc)
+    killed = pids(lines)
+    left = [n for n in os.listdir(d) if n.startswith("_phase5_open_") and n != os.path.basename(others)]
+    check("killed process's open copy removed", raised and killed and left == [], (raised, killed, left))
+    check("another process's copy left alone", os.path.exists(others))
+    w.export(job(12), scratch(12), lines.append)       # and the next map gets a new process
+
     # a scratch project still locked is removed when the process stops
     locked = scratch(10)
     real_remove = os.remove

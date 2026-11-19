@@ -3,7 +3,9 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import gc
+import glob
 import json
+import platform
 import re
 import shutil
 import subprocess
@@ -283,14 +285,18 @@ def _oids_in_view_with_tools(arcpy, layer, view_polygon):
     return oids
 
 
+# Layers the export narrows to each map's features, besides the HFML layer.
+TRACE_LAYER_NAMES = {
+    "Trace_SSGRAVITYMAIN",
+    "Trace Upstream High Freq PM",
+    "Lower_Laterals",
+    "Parcels in the Trace",
+    "Parcels_trace",
+}
+
+
 def _scope_layers(arcpy, map_obj, hfml_id, content_extent=None, log_fn=None):
-    trace_names = {
-        "Trace_SSGRAVITYMAIN",
-        "Trace Upstream High Freq PM",
-        "Lower_Laterals",
-        "Parcels in the Trace",
-        "Parcels_trace",
-    }
+    trace_names = TRACE_LAYER_NAMES
     for layer in map_obj.listLayers():
         if layer.isGroupLayer or not layer.supports("DEFINITIONQUERY"):
             continue
@@ -405,7 +411,12 @@ def _report_offscreen_features(arcpy, hfml, config, camera_extent, log_fn):
 
 def _log_layer_report(arcpy, map_obj, hfml_id, config, log_fn, hfml=None):
     """Log what each HFML/trace layer in the map points at and how many features
-    it will draw, so a map missing the HFML or MLs shows why in the log."""
+    it will draw, so a map missing the HFML or MLs shows why in the log.
+
+    Returns the layers whose drawn count differs from what Phase 4 appended (or
+    could not be counted), as (layer name, role, drawn, appended) -- empty when
+    no record is given."""
+    mismatches = []
     expected = {
         _norm_path(config["p4_ml_layer_path"]): "HFML layer",
         _norm_path(config["p4_ml_dest_path"]): "ML trace",
@@ -447,6 +458,8 @@ def _log_layer_report(arcpy, map_obj, hfml_id, config, log_fn, hfml=None):
             pass
         # NB: not "expected" -- that name holds the path->role map this loop reads.
         expected_count = appended.get(role)
+        if expected_count is not None and (not isinstance(count, int) or count != expected_count):
+            mismatches.append((layer.name, role, count, expected_count))
         note = ""
         if expected_count is not None and isinstance(count, int) and count != expected_count:
             if count < expected_count:
@@ -466,6 +479,7 @@ def _log_layer_report(arcpy, map_obj, hfml_id, config, log_fn, hfml=None):
     for path, role in expected.items():
         if role not in seen:
             log_fn(f"  WARNING: no layer in map '{map_obj.name}' reads the {role} ({path}) — those features won't appear")
+    return mismatches
 
 
 def _page_xy_from_map_point(map_frame, point):
@@ -1149,9 +1163,201 @@ class _Stopwatch:
         return ", ".join(f"{label} {seconds:.1f}s" for label, seconds in ordered)
 
 
+# ---------------------------------------------------------------------------
+# One open map project for the export process
+#
+# Each map used to open its own fresh copy of the map project and paid 11-17s
+# for it (2026-11-19): opening the map's ~32 layers over the network, a cost
+# paid by whichever step first touches them.  The export process now keeps one
+# copy open, and before every map puts back everything an export changes, so
+# the map starts exactly as it would on a fresh copy:
+#   - the definition query, and any selection, of every layer the export
+#     filters (the HFML layer and the trace layers);
+#   - every layout, whole, from its CIM: title, date, callout, arrow, map frame;
+#   - the map's reference scale.
+# A previous map's features cannot reappear either way: Phase 4 deletes them
+# after each map, and every filtered layer is narrowed to the new map's own
+# object IDs, which are never reused.
+#
+# Checked on every map: once the layers are filtered, each one's drawn count
+# is compared with what Phase 4 appended.  On any difference the open copy is
+# dropped and the map redone on a fresh copy, whose result stands, as before.
+# p4_export_keep_project_open: false opens a fresh copy for every map.
+# ---------------------------------------------------------------------------
+
+# The project an export process keeps open; "allowed" is set only by the
+# long-lived export process (a one-map process gains nothing from it).
+_OPEN_PROJECT = {"project": None, "serial": 0, "allowed": False}
+
+
+def _open_copy_path(template, serial, pid=None):
+    """The working copy an export process keeps open, next to the template so
+    its relative data paths still resolve.  Named for this computer and
+    process, so cleaning up after one run never touches another's copy in the
+    same shared folder."""
+    host = re.sub(r"[^A-Za-z0-9-]", "", platform.node())[:24] or "pc"
+    return os.path.join(
+        os.path.dirname(template), f"_phase5_open_{host}_{pid or os.getpid()}_{serial}_tmp.aprx"
+    )
+
+
+def _scoped_layers(map_obj):
+    """The layers whose definition query the export replaces for each map."""
+    return [
+        layer for layer in map_obj.listLayers()
+        if not layer.isGroupLayer and layer.supports("DEFINITIONQUERY")
+        and (layer.name == HFML_LAYER_NAME or layer.name in TRACE_LAYER_NAMES)
+    ]
+
+
+def _layout_elements(layout):
+    """The text, position, size and visibility of the elements an export
+    changes -- text, graphics, map frame -- to confirm a reset really put the
+    layout back.  Legends and scale bars are left out: they can resize with
+    what the map shows."""
+    def read(element, name):
+        try:
+            value = getattr(element, name)
+        except Exception:
+            return None
+        return round(value, 3) if isinstance(value, float) else value
+
+    return [
+        tuple(read(element, name) for name in (
+            "name", "text", "elementPositionX", "elementPositionY",
+            "elementWidth", "elementHeight", "visible",
+        ))
+        for kind in ("TEXT_ELEMENT", "GRAPHIC_ELEMENT", "MAPFRAME_ELEMENT")
+        for element in layout.listElements(kind)
+    ]
+
+
+def _layout_definition(layout):
+    for version in ("V3", "V2"):
+        try:
+            return layout.getDefinition(version)
+        except Exception:
+            continue
+    raise RuntimeError(f"could not read the definition of layout '{layout.name}'")
+
+
+class _OpenProject:
+    """A working copy of the map project, with the template's state recorded
+    on opening so it can be put back before every map."""
+
+    def __init__(self, arcpy, template, path):
+        self.template, self.path = template, path
+        self.stamp = _file_stamp(template)
+        self.aprx = arcpy.mp.ArcGISProject(path)
+        self.map = _get_map(self.aprx)
+        self.queries = [(layer, layer.definitionQuery) for layer in _scoped_layers(self.map)]
+        self.layouts = [
+            (layout, _layout_definition(layout), _layout_elements(layout))
+            for layout in self.aprx.listLayouts()
+        ]
+        self.reference_scale = self.map.referenceScale
+        self.maps = 0
+
+    def still_matches(self, template):
+        """False once the template file is another one or has been saved since."""
+        return self.template == template and self.stamp is not None and _file_stamp(template) == self.stamp
+
+    def reset(self):
+        # Layers first, so the layouts are compared with the map as it was when
+        # the template was recorded.
+        for layer, query in self.queries:
+            layer.definitionQuery = query
+            if layer.getSelectionSet() and not _clear_selection_directly(layer):
+                raise RuntimeError(f"could not clear the selection on layer '{layer.name}'")
+        self.map.referenceScale = self.reference_scale
+        for layout, definition, elements in self.layouts:
+            layout.setDefinition(definition)
+            if _layout_elements(layout) != elements:
+                raise RuntimeError(f"layout '{layout.name}' did not return to the template")
+
+    def close(self):
+        self.queries = self.layouts = None
+        self.map = self.aprx = None
+        gc.collect()
+        try:
+            os.remove(self.path)
+        except OSError:
+            pass  # still locked: the parent removes it once this process exits
+
+
+def close_open_project():
+    """Close the project an export process keeps open, if any."""
+    project, _OPEN_PROJECT["project"] = _OPEN_PROJECT["project"], None
+    if project is not None:
+        project.close()
+
+
+def _acquire_project(arcpy, template, log_fn, watch):
+    """The open project reset for the next map, or a freshly opened copy.
+
+    Returns (project, reused).  A fresh copy is opened for the first map, after
+    the template file is saved, and whenever the reset fails.
+    """
+    project = _OPEN_PROJECT["project"]
+    if project is not None:
+        if project.still_matches(template):
+            try:
+                with watch.part("reset project"):
+                    project.reset()
+                project.maps += 1
+                return project, True
+            except Exception as exc:
+                log_fn(f"  NOTE: could not reset the open map project ({exc}) — opening a fresh copy")
+        else:
+            log_fn("  The map project file has changed — opening a fresh copy")
+        close_open_project()
+
+    _OPEN_PROJECT["serial"] += 1
+    path = _open_copy_path(template, _OPEN_PROJECT["serial"])
+    with watch.part("copy project"):
+        shutil.copy(template, path)
+    try:
+        with watch.part("open project"):
+            project = _OpenProject(arcpy, template, path)
+    except Exception:
+        gc.collect()
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        raise
+    project.maps = 1
+    _OPEN_PROJECT["project"] = project
+    return project, False
+
+
+class _StaleOpenProject(RuntimeError):
+    """The open project drew a different number of features than Phase 4
+    appended, so the map is redone on a fresh copy."""
+
+
 def export_hfml_map(arcpy, hfml, config, today, observations_map, log_fn):
     """Export the PDF map for one HFML.  Called by Phase 4 right after the
     HFML's features are appended, before they are cleaned back out."""
+    keep_open = _OPEN_PROJECT["allowed"] and config.get("p4_export_keep_project_open", True)
+    try:
+        return _export_map(arcpy, hfml, config, today, observations_map, log_fn, keep_open)
+    except _StaleOpenProject as exc:
+        log_fn(f"  {exc} — redoing this map on a fresh copy of the project")
+        close_open_project()
+        try:
+            return _export_map(arcpy, hfml, config, today, observations_map, log_fn, keep_open)
+        except Exception:
+            close_open_project()
+            raise
+    except Exception:
+        # Whatever state the open copy was left in, the next map starts fresh.
+        if keep_open:
+            close_open_project()
+        raise
+
+
+def _export_map(arcpy, hfml, config, today, observations_map, log_fn, keep_open):
     hfml_id = str(hfml["pmnum"])
     watch = _Stopwatch()
     aprx = None
@@ -1170,22 +1376,32 @@ def export_hfml_map(arcpy, hfml, config, today, observations_map, log_fn):
         draft_aprx_path = hfml["draft_aprx_path"]
         os.makedirs(os.path.dirname(pdf_path), exist_ok=True)
         aprx_src = hfml.get("aprx_path") or resolve_project_path(config, log_fn)
-        tmp_aprx = _working_aprx_path(aprx_src, hfml_id)
-        with watch.part("copy project"):
-            shutil.copy(aprx_src, tmp_aprx)
 
-        with watch.part("open project"):
-            aprx = arcpy.mp.ArcGISProject(tmp_aprx)
-            map_obj = _get_map(aprx)
+        if keep_open:
+            project, reused = _acquire_project(arcpy, aprx_src, log_fn, watch)
+            aprx, map_obj = project.aprx, project.map
+            if reused:
+                log_fn(f"  Map project: reusing the open copy (map {project.maps} on it), reset to the template")
+        else:
+            reused = False
+            tmp_aprx = _working_aprx_path(aprx_src, hfml_id)
+            with watch.part("copy project"):
+                shutil.copy(aprx_src, tmp_aprx)
+            with watch.part("open project"):
+                aprx = arcpy.mp.ArcGISProject(tmp_aprx)
+                map_obj = _get_map(aprx)
 
-        # Clear any selections carried over from the user's ArcGIS Pro session
-        with watch.part("clear selections"):
-            cleared = _clear_layer_selections(arcpy, map_obj, template=aprx_src, log_fn=log_fn)
-        if cleared:
-            log_fn(
-                f"  Cleared selections saved in the project on {len(cleared)} layer(s): "
-                f"{', '.join(cleared)} — clear them in the project and save to skip this"
-            )
+        # Clear any selections carried over from the user's ArcGIS Pro session.
+        # A reused copy had them cleared when it was opened, and its reset
+        # clears any on the layers the export filters.
+        if not reused:
+            with watch.part("clear selections"):
+                cleared = _clear_layer_selections(arcpy, map_obj, template=aprx_src, log_fn=log_fn)
+            if cleared:
+                log_fn(
+                    f"  Cleared selections saved in the project on {len(cleared)} layer(s): "
+                    f"{', '.join(cleared)} — clear them in the project and save to skip this"
+                )
 
         with watch.part("layout and camera"):
             layout = _get_layout(aprx, layout_name)
@@ -1206,7 +1422,15 @@ def export_hfml_map(arcpy, hfml, config, today, observations_map, log_fn):
         with watch.part("scope layers"):
             _scope_layers(arcpy, map_obj, hfml_id, camera_extent, log_fn)
         with watch.part("layer report"):
-            _log_layer_report(arcpy, map_obj, hfml_id, config, log_fn, hfml=hfml)
+            mismatches = _log_layer_report(arcpy, map_obj, hfml_id, config, log_fn, hfml=hfml)
+        if reused and mismatches:
+            raise _StaleOpenProject(
+                "The open map project drew "
+                + "; ".join(
+                    f"{drawn} feature(s) on '{name}' where Phase 4 appended {appended}"
+                    for name, _role, drawn, appended in mismatches
+                )
+            )
         with watch.part("offscreen check"):
             _report_offscreen_features(arcpy, hfml, config, camera_extent, log_fn)
         with watch.part("text and callout"):
@@ -1247,10 +1471,9 @@ def export_hfml_map(arcpy, hfml, config, today, observations_map, log_fn):
     finally:
         if watch.parts:
             log_fn(f"  Inside the export: {watch.summary()}")
-        try:
-            del aprx
-        except Exception:
-            pass
+        # The open copy stays open for the next map; a one-map copy is released
+        # and removed.
+        aprx = None
         if tmp_aprx:
             try:
                 os.remove(tmp_aprx)
@@ -1304,8 +1527,8 @@ def _export_one(arcpy, base_config, hfml, log_fn):
 # the ArcGIS Pro process, so maps are exported by a separate python.exe.  That
 # process used to be started for every map, paying ~7.5s each time to start
 # Python and import arcpy (2026-11-17).  It is now started once and handed one
-# map at a time.  Each map still opens its own fresh copy of the project, so
-# nothing about one map can carry into the next.
+# map at a time, and keeps one copy of the map project open between maps (see
+# _OpenProject), reset to the template before each one.
 # ---------------------------------------------------------------------------
 
 _RESULT_MARKER = "@@HFML-EXPORT-RESULT@@ "
@@ -1335,8 +1558,8 @@ def _export_worker_serve(handle_job, stdin=None, stdout=None):
         except Exception:
             print(traceback.format_exc(), file=stdout, flush=True)
             result = {"ok": False}
-        # Release the job's project before reporting, so the parent can delete
-        # its scratch copy.
+        # Release anything the job left behind before reporting, so the parent
+        # can delete a one-map scratch copy.  The open project stays open.
         gc.collect()
         print(_RESULT_MARKER + json.dumps(result), file=stdout, flush=True)
 
@@ -1359,7 +1582,11 @@ def _export_worker_main():
     from backend.phase4.run import _quiet_geoprocessing
     _quiet_geoprocessing(arcpy).__enter__()
     base_config = load_config()
-    _export_worker_serve(lambda hfml: _export_one(arcpy, base_config, hfml, log_fn))
+    _OPEN_PROJECT["allowed"] = True
+    try:
+        _export_worker_serve(lambda hfml: _export_one(arcpy, base_config, hfml, log_fn))
+    finally:
+        close_open_project()
 
 
 class _ExportWorker:
@@ -1374,6 +1601,7 @@ class _ExportWorker:
         self.proc = None
         self.maps = 0
         self.pending_scratch = []
+        self.scratch_dir = None
 
     def _start(self):
         env = dict(os.environ, PYTHONIOENCODING="utf-8")
@@ -1405,6 +1633,12 @@ class _ExportWorker:
         except Exception:
             proc.kill()
             proc.wait()
+        # The process removes the project copy it kept open when it exits
+        # normally; one that was killed, or held it locked, leaves it behind.
+        if self.scratch_dir:
+            pattern = os.path.basename(_open_copy_path("", "*", pid=proc.pid))
+            for path in glob.glob(os.path.join(self.scratch_dir, pattern)):
+                self._remove_scratch(path, None)
 
     def _read_result(self, log_fn):
         """Pass the job's output to the log; return its result, or None if the
@@ -1419,6 +1653,8 @@ class _ExportWorker:
 
     def export(self, hfml, scratch_path, log_fn):
         hfml_id = str(hfml["pmnum"])
+        if scratch_path:
+            self.scratch_dir = os.path.dirname(scratch_path)
         for attempt in (1, 2):
             if self.proc is not None and self.maps >= self.max_maps:
                 log_fn(f"  export process: starting a fresh one after {self.maps} maps")
