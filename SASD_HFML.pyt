@@ -1,5 +1,6 @@
 import importlib
 import os
+import re
 import sys
 
 import arcpy
@@ -12,7 +13,7 @@ PHASES = [
     ("backend.phase1.run", "Import SQL query results into Excel"),
     ("backend.phase2.run", "Detect ML changes and rebuild workbook"),
     ("backend.phase3.run", "Sync Excel data to ArcGIS attribute table"),
-    ("backend.phase4.run", "Trace and map the next 5 new HFMLs"),
+    ("backend.phase4.run", "Trace and map the next 25 new HFMLs"),
     ("backend.phase5.run", "Verify PDF maps from Phase 4"),
 ]
 
@@ -62,7 +63,8 @@ class RunPipeline:
         return True
 
     def execute(self, parameters, messages):
-        selected = set(parameters[0].values or [])
+        # Matched on "Phase N:" so a run from history still finds a phase whose label has changed.
+        selected = {int(m.group(1)) for v in parameters[0].values or [] if (m := re.match(r"Phase (\d+):", str(v)))}
         # Pro keeps modules cached between runs; reload so code edits take effect without restarting Pro.
         # Reload every phase (not just the selected ones) since Phase 4 imports helpers from Phase 5.
         importlib.reload(importlib.import_module("config_loader"))
@@ -76,7 +78,7 @@ class RunPipeline:
             importlib.reload(module)
         modules = [importlib.reload(importlib.import_module(name)) for name, _ in PHASES]
         for i, ((_, label), module) in enumerate(zip(PHASES, modules), 1):
-            if _phase_choice(i, label) not in selected:
+            if i not in selected:
                 continue
             arcpy.SetProgressorLabel(f"Phase {i}: {label}")
             arcpy.AddMessage(f"=== Phase {i}: {label} ===")

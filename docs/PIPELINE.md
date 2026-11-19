@@ -76,9 +76,10 @@
 
 ## Phase 4: Trace, Map, and Clean Up New HFMLs
 
-Beta testing: only the first `MAX_HFMLS_PER_RUN` (5) new HFMLs are processed per run
-(set in `backend/phase4/run.py`). An HFML counts as done once its PDF exists in
-`pdf_output_dir` or one of its run folders, so each run picks up the next 5.
+Only the first `MAX_HFMLS_PER_RUN` (25) new HFMLs are processed per run
+(set in `backend/phase4/run.py`; 5 until 2026-11-19). An HFML counts as done once
+its PDF exists in `pdf_output_dir` or one of its run folders, so each run picks up
+the next 25.
 
 Each run writes to its own folder:
 

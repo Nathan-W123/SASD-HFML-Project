@@ -38,9 +38,8 @@ MAX_GAP_REPORT_LINES = 10
 # Buckets for the once-per-cache-build report on how close manholes sit to each
 # other without sharing a key.  The shape of this picks the snap tolerance.
 GAP_HISTOGRAM_BUCKETS = (0.01, 0.1, 0.5, 1.0)
-# Beta testing: only map this many new HFMLs per run.  Raise (or remove) once
-# the full monthly batch should be processed.
-MAX_HFMLS_PER_RUN = 5
+# Raised from 5 to 25 on 2026-11-19, once a map after the first took ~12s.
+MAX_HFMLS_PER_RUN = 25
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 ADDED_MLS_PATH = os.path.join(PROJECT_ROOT, "temp", "added_mls.json")
 PHASE4_MAP_OUTPUT_PATH = os.path.join(PROJECT_ROOT, "temp", "phase4_mapped_hfmls.json")
