@@ -1,5 +1,7 @@
 import math
 import os
+import platform
+import re
 import sys
 import time
 from contextlib import contextmanager
@@ -8,7 +10,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 import json
 
 from backend.phase4.network_cache import (
-    Phase4Cache, dataset_signature, default_cache_dir, free_gb, signature_is_weak,
+    Phase4Cache, _gdb_root, _table_files, dataset_signature, default_cache_dir, free_gb,
+    signature_is_weak,
 )
 from config_loader import load_config
 
@@ -246,13 +249,79 @@ def _require_dataset(arcpy, path, label, log_fn):
     log_fn(f"{label}: {path}")
 
 
-def _require_write_lock(arcpy, path, label):
-    if not arcpy.TestSchemaLock(path):
-        raise RuntimeError(
-            f"{label} is locked and cannot be written: {path}. "
-            "Close ArcGIS Pro maps, attribute tables, edit sessions, Catalog previews, "
-            "or any other tools using this geodatabase, then rerun Phase 4."
-        )
+# Seconds to wait before asking again whether a destination is free.  A map
+# export process from a run that has just ended can take a few seconds to close.
+WRITE_LOCK_WAITS = (2, 5)
+
+# A file geodatabase lock file: <table>.<computer>.<process id>.<thread>.<kind>.lock
+_LOCK_FILE = re.compile(r"^(?P<table>[^.]+)\.(?P<host>[^.]+)\.(?P<pid>\d+)\.\d+\.(?P<kind>[a-z]+)\.lock$", re.I)
+_LOCK_KINDS = {"sr": "reading", "ed": "editing", "wr": "writing", "rd": "reading"}
+
+
+def _lock_holders(arcpy, path):
+    """Which computers and processes hold locks on this table, read from the
+    geodatabase's lock files: [(computer, process id, [what])].  Locks on the
+    table itself when its files can be identified, else on the geodatabase.
+    Empty when there are none or they cannot be read."""
+    root = _gdb_root(path)
+    if not root or not os.path.isdir(root):
+        return []
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return []
+    table_id = None
+    try:
+        found = _table_files(arcpy, path, int(arcpy.management.GetCount(path)[0]))
+        table_id = found[0] if found else None
+    except Exception:
+        pass
+    holders = {}
+    for name in names:
+        m = _LOCK_FILE.match(name)
+        if not m:
+            continue
+        if table_id and m.group("table").lower() != table_id:
+            continue
+        key = (m.group("host"), int(m.group("pid")))
+        holders.setdefault(key, set()).add(_LOCK_KINDS.get(m.group("kind").lower(), m.group("kind")))
+    return [(host, pid, sorted(kinds)) for (host, pid), kinds in sorted(holders.items())]
+
+
+def _describe_lock_holders(holders):
+    me_host = platform.node().split(".")[0].lower()
+    me_pid = os.getpid()
+    lines = []
+    for host, pid, kinds in holders:
+        what = " and ".join(kinds)
+        if host.lower() == me_host and pid == me_pid:
+            continue    # this ArcGIS Pro, which runs the tool
+        if host.lower() == me_host:
+            lines.append(
+                f"  - process {pid} on this computer ({what}). In Task Manager > Details, find PID {pid}: "
+                "python.exe is a map export left from an earlier run and can be ended; "
+                "ArcGISPro.exe is another ArcGIS Pro window with this data open."
+            )
+        else:
+            lines.append(f"  - computer {host}, process {pid} ({what}): someone there has this data open.")
+    return lines
+
+
+def _require_write_lock(arcpy, path, label, log_fn=None, waits=WRITE_LOCK_WAITS):
+    for wait in (0,) + tuple(waits):
+        if wait:
+            if log_fn:
+                log_fn(f"  {label} is in use — checking again in {wait}s")
+            time.sleep(wait)
+        if arcpy.TestSchemaLock(path):
+            return
+    holders = _describe_lock_holders(_lock_holders(arcpy, path))
+    raise RuntimeError(
+        f"{label} is locked and cannot be written: {path}. "
+        + ("Held by:\n" + "\n".join(holders) + "\n" if holders else "")
+        + "Close ArcGIS Pro maps, attribute tables, edit sessions, Catalog previews, "
+        "or any other tools using this geodatabase, then rerun Phase 4."
+    )
 
 
 def _describe_sr(arcpy, path):
@@ -309,7 +378,7 @@ def _preflight_phase4(arcpy, config, log_fn):
         ("Parcels destination", config["p4_parcels_dest_path"]),
     ]
     for label, path in writable_targets:
-        _require_write_lock(arcpy, path, label)
+        _require_write_lock(arcpy, path, label, log_fn)
     log_fn("Phase 4 destination write locks available")
     _scratch_workspace(arcpy, log_fn)
     _report_spatial_references(arcpy, config, log_fn)

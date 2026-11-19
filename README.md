@@ -309,6 +309,23 @@ form changed. If whatever republishes SQL_WEB.gdb rewrites every table each
 time, the mainlines and parcels are still re-copied every time — the log will
 show their table files changing.
 
+### When a destination is locked
+
+Phase 4 stops before tracing if another program has one of its destination
+tables open (2026-11-19, `Trace_SSGRAVITYMAIN`). It now asks again after 2s
+and 5s — a map export process from a run that has just ended can take a few
+seconds to close — and if the table is still locked, names who holds it, read
+from the geodatabase's lock files:
+
+```
+Held by:
+  - process 4242 on this computer (reading). In Task Manager > Details, find PID 4242: ...
+  - computer OTHERPC, process 5555 (editing): someone there has this data open.
+```
+
+On this computer, `python.exe` is a map export left from an earlier run and
+can be ended; `ArcGISPro.exe` is another ArcGIS Pro window with the data open.
+
 ### When PM_Mainlines briefly reads as missing
 
 Twice (2026-11-17, 2026-11-19) the share has answered "PM_Mainlines does not
