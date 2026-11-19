@@ -253,10 +253,14 @@ changes, so each map starts exactly as a fresh copy would:
   — the HFML layer and the trace layers. This part is essential: the export
   reads those layers through their current query, so the previous map's query
   would hide the new HFML and narrow the traces to the previous map's IDs;
-- every layout, whole, from its CIM — title, date, callout, arrow, map frame
-  — then checked: every text, graphic and map frame element must be back at
-  the template's text, position, size and visibility, or a fresh copy is
-  opened instead;
+- the two layouts the export draws on ("Vertical Layout", "Horizontal
+  Layout"), whole, from their CIM — title, date, callout, arrow, map frame —
+  then checked: every text, graphic and map frame element must be back at the
+  template's text, position, size and visibility (within 0.01 in), or a fresh
+  copy is opened instead, and the log says which element differed and how.
+  Other layouts in the project are never touched, so not reset or checked
+  (the first real run, 2026-11-19, checked them all and an unused one,
+  `High_Freq_Hydros_Vertical1`, failed every reset);
 - the map's reference scale.
 
 A previous map's features cannot reappear on a later one, nearby or not:

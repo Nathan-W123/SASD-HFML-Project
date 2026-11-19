@@ -122,6 +122,8 @@ class Element:
     def text(self):
         if "text" not in self.d:
             raise AttributeError("text")            # map frames and graphics have none
+        if self.d.get("dynamic"):                   # e.g. a clock: different on every read
+            return f"{self.d['text']} {W.clock}"
         return self.d["text"]
     @text.setter
     def text(self, v):
@@ -234,7 +236,13 @@ TEMPLATE = {
          "query": "STATUS IN ('OPERATING', 'TOBEMOD')", "selection": [5]},
         {"name": "Parcels in the Trace", "source": "Parcels_trace"},
     ]},
-    "layouts": [layout("Horizontal Layout", 16.0, 7.5), layout("Vertical Layout", 10.0, 13.5)],
+    "layouts": [
+        # An old layout the export never uses, with text that reads differently
+        # every time -- like 'High_Freq_Hydros_Vertical1' in TEST.aprx (2026-11-19).
+        {"name": "High_Freq_Hydros_Vertical1", "elements": [
+            dict(text("Updated", "Updated", 1.0, 1.0), dynamic=True)]},
+        layout("Horizontal Layout", 16.0, 7.5), layout("Vertical Layout", 10.0, 13.5),
+    ],
 }
 
 # ---- Phase 4's side: append, export, delete -------------------------------
@@ -291,7 +299,9 @@ def run(maps, keep_open, tmp, fail=None, change_template_before=None, stale=Fals
         for m in maps:
             if change_template_before == m["pmnum"]:
                 changed = copy.deepcopy(TEMPLATE)
-                changed["layouts"][0]["elements"][1]["text"] = "Figure XXX - Area of Interest (rev)\nStop The Clog Strategy"
+                horizontal = next(l for l in changed["layouts"] if l["name"] == "Horizontal Layout")
+                figure = next(e for e in horizontal["elements"] if e["name"] == "Figure")
+                figure["text"] = "Figure XXX - Area of Interest (rev)\nStop The Clog Strategy"
                 with open(template, "w") as f:
                     json.dump(changed, f)
                 st = os.stat(template); os.utime(template, (st.st_atime, st.st_mtime + 10))
@@ -424,6 +434,9 @@ try:
           diff(kept["exports"], fresh["exports"]))
     check("silent reset failure: caught and a fresh copy opened",
           kept["opens"] == 2 and any("did not return to the template" in l for l in kept["lines"]),
+          (kept["opens"], [l for l in kept["lines"] if "reset" in l]))
+    check("  and the log says which element and what",
+          any("'Figure' text" in l and "expected 'Figure XXX - Area of Interest" in l for l in kept["lines"]),
           (kept["opens"], [l for l in kept["lines"] if "reset" in l]))
 
     # 6. Switched off: a fresh copy per map, as before.

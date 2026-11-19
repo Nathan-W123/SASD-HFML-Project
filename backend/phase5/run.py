@@ -1210,6 +1210,15 @@ def _scoped_layers(map_obj):
     ]
 
 
+# The layouts an export draws on.  Only these are reset between maps: the
+# export never touches any other layout in the project (2026-11-19: checking
+# an unused one, 'High_Freq_Hydros_Vertical1', failed every reset).
+EXPORT_LAYOUT_NAMES = (VERTICAL_LAYOUT_NAME, HORIZONTAL_LAYOUT_NAME)
+_ELEMENT_FIELDS = ("text", "elementPositionX", "elementPositionY", "elementWidth", "elementHeight", "visible")
+# Page inches; positions and sizes closer than this count as the same.
+_ELEMENT_TOLERANCE = 0.01
+
+
 def _layout_elements(layout):
     """The text, position, size and visibility of the elements an export
     changes -- text, graphics, map frame -- to confirm a reset really put the
@@ -1217,19 +1226,31 @@ def _layout_elements(layout):
     what the map shows."""
     def read(element, name):
         try:
-            value = getattr(element, name)
+            return getattr(element, name)
         except Exception:
             return None
-        return round(value, 3) if isinstance(value, float) else value
 
     return [
-        tuple(read(element, name) for name in (
-            "name", "text", "elementPositionX", "elementPositionY",
-            "elementWidth", "elementHeight", "visible",
-        ))
+        (read(element, "name"),) + tuple(read(element, name) for name in _ELEMENT_FIELDS)
         for kind in ("TEXT_ELEMENT", "GRAPHIC_ELEMENT", "MAPFRAME_ELEMENT")
         for element in layout.listElements(kind)
     ]
+
+
+def _layout_differences(expected, found):
+    """What differs between two _layout_elements readouts, in words."""
+    if [e[0] for e in expected] != [f[0] for f in found]:
+        return [f"elements {[e[0] for e in found]}, expected {[e[0] for e in expected]}"]
+    differences = []
+    for want, got in zip(expected, found):
+        for field, a, b in zip(_ELEMENT_FIELDS, want[1:], got[1:]):
+            if isinstance(a, (int, float)) and isinstance(b, (int, float)) and not isinstance(a, bool):
+                if abs(a - b) <= _ELEMENT_TOLERANCE:
+                    continue
+            elif a == b:
+                continue
+            differences.append(f"'{want[0]}' {field} {b!r}, expected {a!r}")
+    return differences
 
 
 def _layout_definition(layout):
@@ -1254,6 +1275,7 @@ class _OpenProject:
         self.layouts = [
             (layout, _layout_definition(layout), _layout_elements(layout))
             for layout in self.aprx.listLayouts()
+            if layout.name in EXPORT_LAYOUT_NAMES
         ]
         self.reference_scale = self.map.referenceScale
         self.maps = 0
@@ -1272,8 +1294,13 @@ class _OpenProject:
         self.map.referenceScale = self.reference_scale
         for layout, definition, elements in self.layouts:
             layout.setDefinition(definition)
-            if _layout_elements(layout) != elements:
-                raise RuntimeError(f"layout '{layout.name}' did not return to the template")
+            differences = _layout_differences(elements, _layout_elements(layout))
+            if differences:
+                raise RuntimeError(
+                    f"layout '{layout.name}' did not return to the template: "
+                    + "; ".join(differences[:4])
+                    + (f" and {len(differences) - 4} more" if len(differences) > 4 else "")
+                )
 
     def close(self):
         self.queries = self.layouts = None
