@@ -149,7 +149,7 @@ def _collect_extents_by_oid(arcpy, oid_list, source_path, extents):
                 extents.append(geom.extent)
 
 
-def _get_phase4_feature_info(arcpy, hfml, config, log_fn=None):
+def _get_phase4_feature_info(arcpy, hfml, config, log_fn=None, pm_row=None):
     pmnum = str(hfml["pmnum"])
     extents = []
     seed_target = None
@@ -162,17 +162,9 @@ def _get_phase4_feature_info(arcpy, hfml, config, log_fn=None):
             log_fn(f"  Seed extent from HFML layer: X[{seed_extent.XMin:.0f},{seed_extent.XMax:.0f}]")
     except ValueError:
         # New HFML not in PMs_SSGRAVITYMAIN — look up its own geometry via PM_Mainlines -> assetnum -> SASD_SSGRAVITYMAIN
-        assetnum = None
-        try:
-            with arcpy.da.SearchCursor(
-                config["feature_class_path"], ["assetnum"],
-                f"pmnum = '{_sql_literal(pmnum)}'"
-            ) as cur:
-                for (a,) in cur:
-                    assetnum = _display(a).strip() if a else None
-                    break
-        except Exception:
-            pass
+        row = pm_row if pm_row is not None else _read_pm_row(arcpy, config, pmnum, log_fn)
+        a = row.get("assetnum")
+        assetnum = _display(a).strip() if a else None
 
         if assetnum:
             try:
@@ -601,21 +593,62 @@ def _best_callout_position(map_frame, feature_extent, target_x, target_y, box_w,
     return (best[1], best[2]) if best else (x_min, y_max)
 
 
-def _lookup_gridno(arcpy, config, hfml_id):
-    """Return the gridno for this PM, falling back to hfml_id if not found."""
-    try:
-        available = {f.name.lower(): f.name for f in arcpy.ListFields(config["feature_class_path"])}
-        if "gridno" not in available:
-            return hfml_id
-        with arcpy.da.SearchCursor(
-            config["feature_class_path"], [available["gridno"]],
-            f"pmnum = '{_sql_literal(hfml_id)}'"
-        ) as cur:
-            for (val,) in cur:
-                return _display(val) if val else hfml_id
-    except Exception:
-        pass
-    return hfml_id
+# Waits between attempts to read PM_Mainlines.  Twice now (2026-11-17,
+# 2026-11-19) the share has briefly reported the table missing on the first read
+# after Phase 3 rewrote it, then served it normally seconds later.
+_PM_READ_WAITS = (2, 5, 10)
+
+
+def _read_pm_row(arcpy, config, hfml_id, log_fn=None, waits=_PM_READ_WAITS):
+    """This PM's row from PM_Mainlines as {lower-case field name: value}.
+
+    {} if the pmnum is not in the table -- a real answer, which callers handle
+    as before.  A read that fails is retried after clearing the workspace
+    cache; if it still fails, this raises.  That fails the map, which is rolled
+    back and retried next run.  The alternative -- carrying on with a fallback
+    figure label or an empty callout -- exports a wrong map that is then marked
+    done and never redone.
+    """
+    path = config["feature_class_path"]
+
+    def _read():
+        fields = [
+            f.name for f in arcpy.ListFields(path)
+            if f.type not in ("OID", "Geometry", "GlobalID", "Blob", "Raster")
+        ]
+        with arcpy.da.SearchCursor(path, fields, f"pmnum = '{_sql_literal(hfml_id)}'") as cursor:
+            for row in cursor:
+                return {name.lower(): value for name, value in zip(fields, row)}
+        return {}
+
+    attempt = 0
+    while True:
+        try:
+            return _read()
+        except Exception as exc:
+            if attempt >= len(waits):
+                raise RuntimeError(
+                    f"Reading PM_Mainlines for pmnum {hfml_id} failed after {attempt + 1} attempts: {exc}"
+                ) from exc
+            wait = waits[attempt]
+            attempt += 1
+            if log_fn:
+                log_fn(f"  NOTE: reading PM_Mainlines failed ({exc}) — retrying in {wait}s")
+            try:
+                arcpy.management.ClearWorkspaceCache()
+            except Exception:
+                pass
+            time.sleep(wait)
+
+
+def _lookup_gridno(arcpy, config, hfml_id, pm_row=None, log_fn=None):
+    """Return the gridno for this PM, falling back to hfml_id if it has none.
+
+    No longer falls back when PM_Mainlines cannot be read -- see _read_pm_row.
+    """
+    row = pm_row if pm_row is not None else _read_pm_row(arcpy, config, hfml_id, log_fn)
+    value = row.get("gridno")
+    return _display(value) if value else hfml_id
 
 
 def _set_text_elements(layout, hfml_id, gridno, today, log_fn=None):
@@ -634,31 +667,20 @@ def _set_text_elements(layout, hfml_id, gridno, today, log_fn=None):
 
 
 
-def _get_callout_text(arcpy, config, hfml_id, observations="", log_fn=None, gridno=None):
-    # Step 1: pull PM attributes directly from PM_Mainlines.
+def _get_callout_text(arcpy, config, hfml_id, observations="", log_fn=None, gridno=None, pm_row=None):
+    # Step 1: PM attributes from this PM's PM_Mainlines row.
     # Accept a pre-fetched gridno to avoid a redundant lookup.
     frequency = ""
     last_date = ""
     assetnum = ""
     gridno = gridno or hfml_id
 
-    pm_available = {f.name.lower(): f.name for f in arcpy.ListFields(config["feature_class_path"])}
-    pm_fields = [pm_available[c] for c in ["pmnum", "frequency", "laststartdate", "assetnum", "gridno"] if c in pm_available]
-    try:
-        with arcpy.da.SearchCursor(
-            config["feature_class_path"], pm_fields,
-            f"pmnum = '{_sql_literal(hfml_id)}'"
-        ) as cursor:
-            for row in cursor:
-                rd = {k.lower(): v for k, v in zip(pm_fields, row)}
-                frequency = _display(rd.get("frequency") or "")
-                last_date = rd.get("laststartdate") or ""
-                assetnum  = _display(rd.get("assetnum") or "")
-                gridno    = _display(rd.get("gridno") or gridno)
-                break
-    except Exception as exc:
-        if log_fn:
-            log_fn(f"PM_Mainlines lookup failed for {hfml_id}: {exc}")
+    rd = pm_row if pm_row is not None else _read_pm_row(arcpy, config, hfml_id, log_fn)
+    if rd:
+        frequency = _display(rd.get("frequency") or "")
+        last_date = rd.get("laststartdate") or ""
+        assetnum  = _display(rd.get("assetnum") or "")
+        gridno    = _display(rd.get("gridno") or gridno)
 
     # Step 2: pull pipe attributes from SASD_SSGRAVITYMAIN by MXASSETNUM
     grid_no  = gridno
@@ -1022,8 +1044,12 @@ def export_hfml_map(arcpy, hfml, config, today, observations_map, log_fn):
     aprx = None
     tmp_aprx = None
     try:
+        with watch.part("PM_Mainlines row"):
+            pm_row = _read_pm_row(arcpy, config, hfml_id, log_fn)
         with watch.part("feature extents"):
-            extent, target_point, hfml_extent = _get_phase4_feature_info(arcpy, hfml, config, log_fn)
+            extent, target_point, hfml_extent = _get_phase4_feature_info(
+                arcpy, hfml, config, log_fn, pm_row=pm_row
+            )
         layout_name, orientation = _select_template(extent, config)
         log_fn(f"Selected {orientation} layout for HFML {hfml_id}")
 
@@ -1071,14 +1097,15 @@ def export_hfml_map(arcpy, hfml, config, today, observations_map, log_fn):
         with watch.part("offscreen check"):
             _report_offscreen_features(arcpy, hfml, config, camera_extent, log_fn)
         with watch.part("text and callout"):
-            gridno = _lookup_gridno(arcpy, config, hfml_id)
+            gridno = _lookup_gridno(arcpy, config, hfml_id, pm_row=pm_row)
             _set_text_elements(layout, hfml_id, gridno, today, log_fn)
             _try_add_callout(
                 layout,
                 map_frame,
                 extent,
                 target_point,
-                _get_callout_text(arcpy, config, hfml_id, observations_map.get(hfml_id, ""), log_fn, gridno=gridno),
+                _get_callout_text(arcpy, config, hfml_id, observations_map.get(hfml_id, ""), log_fn,
+                                  gridno=gridno, pm_row=pm_row),
                 log_fn,
                 hfml_extent=hfml_extent,
             )

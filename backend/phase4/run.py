@@ -62,19 +62,33 @@ def _clear_workspace_cache(arcpy):
         pass
 
 
-def _with_arcpy_retry(arcpy, action, context):
+# Waits for reads of PM_Mainlines, which the share has twice briefly reported
+# missing after Phase 3 rewrote it -- once three minutes later (2026-11-19).
+# Matches the export's schedule (_PM_READ_WAITS in phase5).
+PM_READ_WAITS = (2, 5, 10)
+
+
+def _with_arcpy_retry(arcpy, action, context, waits=None):
+    """Run action, retrying after clearing the workspace cache.
+
+    waits are the pauses between attempts; by default 1s then 2s, i.e. three
+    attempts, as before.
+    """
+    if waits is None:
+        waits = tuple(range(1, ARCPY_RETRY_ATTEMPTS))
+    attempts = len(waits) + 1
     last_exc = None
-    for attempt in range(1, ARCPY_RETRY_ATTEMPTS + 1):
+    for attempt in range(1, attempts + 1):
         try:
             return action()
         except Exception as exc:
             last_exc = exc
-            if attempt == ARCPY_RETRY_ATTEMPTS:
+            if attempt == attempts:
                 break
             _clear_workspace_cache(arcpy)
-            time.sleep(attempt)
+            time.sleep(waits[attempt - 1])
     raise RuntimeError(
-        f"{context} failed after {ARCPY_RETRY_ATTEMPTS} attempts. Last error: {last_exc}"
+        f"{context} failed after {attempts} attempts. Last error: {last_exc}"
     ) from last_exc
 
 
@@ -1470,7 +1484,8 @@ def _append_seed_to_hfml_layer(arcpy, seed_oids, ml_source, hfml_layer, pmnum, p
     # attributes: a map that exports is marked done and never redone, while a
     # failed HFML is rolled back and picked up again on the next run.
     pm_values = _with_arcpy_retry(
-        arcpy, _read_pm_values, f"Reading PM_Mainlines attributes for pmnum {pmnum}"
+        arcpy, _read_pm_values, f"Reading PM_Mainlines attributes for pmnum {pmnum}",
+        waits=PM_READ_WAITS,
     )
 
     copies = {}

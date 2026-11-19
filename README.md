@@ -225,6 +225,20 @@ changes, each with a fallback to the previous behaviour:
   with a stale selection either way. Clearing the selections in the project
   and saving it removes the step entirely.
 
+### When PM_Mainlines briefly reads as missing
+
+Twice (2026-11-17, 2026-11-19) the share has answered "PM_Mainlines does not
+exist" to the first read after Phase 3 rewrote that table — once three minutes
+later — then served it normally seconds afterwards. Every read of it now
+retries, clearing the workspace cache, after 2s, 5s and 10s.
+
+The export reads this PM's row once per map (`_read_pm_row`) and uses it for
+the figure label, the callout and, for a new HFML, the map extent. If it still
+cannot be read, the map fails — it is rolled back and retried next run —
+rather than being exported with the HFML number in place of the gridno or an
+empty callout, which is what the previous fallbacks did and which would then
+have been marked done and never redone.
+
 ### Appended features that are not drawn
 
 The export narrows each trace layer to the map view by reading the layer and

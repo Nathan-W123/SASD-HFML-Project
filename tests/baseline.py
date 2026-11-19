@@ -21,22 +21,26 @@ import tempfile
 # The last commit before 5cb1eb9 ("Select laterals and parcels without
 # schema-changing tool calls").
 BASELINE_COMMIT = "1cfee6f"
+# The export before PM_Mainlines was read once per map with retries.
+EXPORT_BASELINE_COMMIT = "fe33381"
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def load_baseline():
+def load_baseline(path="backend/phase4/run.py", commit=BASELINE_COMMIT):
+    """A file of the project as it stood at `commit`, loaded as a module."""
     try:
         source = subprocess.run(
-            ["git", "-C", _ROOT, "show", f"{BASELINE_COMMIT}:backend/phase4/run.py"],
+            ["git", "-C", _ROOT, "show", f"{commit}:{path}"],
             capture_output=True, text=True, check=True,
         ).stdout
     except (OSError, subprocess.CalledProcessError):
         return None
+    name = "baseline_" + path.replace("/", "_").replace(".py", "") + "_" + commit
     folder = tempfile.mkdtemp(prefix="hfml_baseline_")
-    path = os.path.join(folder, "phase4_run_baseline.py")
+    path = os.path.join(folder, name + ".py")
     with open(path, "w", encoding="utf-8") as f:
         f.write(source)
-    spec = importlib.util.spec_from_file_location("phase4_run_baseline", path)
+    spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
