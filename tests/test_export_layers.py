@@ -1,4 +1,4 @@
-import sys, types
+import shutil, sys, types
 import os, sys
 # Run from anywhere: put this folder (stand-ins, shared helpers) and the
 # project root (backend, config_loader) on the import path.
@@ -66,6 +66,81 @@ check("fallbacks reported as such", sorted(n) == ["ignored (with the selection t
 calls.clear()
 P5._clear_layer_selections(arcpy, Map([Layer(f"L{i}", selection=set()) for i in range(20)]))
 check("no tool calls when nothing is selected", calls == [], calls)
+
+# ---- the project's layers are checked once per run --------------------------
+import tempfile, time as _t
+class Timed(Layer):
+    checked = []
+    def __init__(self, *a, delay=0.0, broken=False, **k):
+        super().__init__(*a, **k); self._delay, self.isBroken = delay, broken
+    def getSelectionSet(self):
+        Timed.checked.append(self.name)
+        if self._delay: _t.sleep(self._delay)
+        return super().getSelectionSet()
+
+def project(selected=("Spill",)):
+    """A fresh copy of the same template: same layers, same saved selections."""
+    names = ["Spill", "High Freq ML PMs", "Parcels", "Laterals", "Mains", "Basemap roads"]
+    return Map([Timed(n, selection=({7} if n in selected else set()),
+                      delay=0.6 if n == "Basemap roads" else 0.0, broken=(n == "Basemap roads"))
+                for n in names])
+
+tmpdir = tempfile.mkdtemp()
+template = os.path.join(tmpdir, "TEST.aprx")
+with open(template, "w") as f:
+    f.write("v1")
+P5._TEMPLATE_SELECTIONS.clear()
+
+lines = []
+Timed.checked = []
+first = P5._clear_layer_selections(arcpy, project(), template=template, log_fn=lines.append)
+# (a cleared layer is asked twice: once to check, once to confirm the clear took)
+check("first map checks every layer", len(set(Timed.checked)) == 6, Timed.checked)
+check("first map clears the saved selection", first == ["Spill"], first)
+check("scan summary logged", any("Checked 6 layer(s)" in l and "1 had one" in l for l in lines), lines)
+check("slow and broken layer named",
+      any("Slowest layers to check" in l and "Basemap roads" in l and "broken data source" in l for l in lines), lines)
+
+lines = []
+Timed.checked = []
+second = P5._clear_layer_selections(arcpy, project(), template=template, log_fn=lines.append)
+check("later maps check only the layer that had a selection", set(Timed.checked) == {"Spill"}, Timed.checked)
+check("and still clear it", second == ["Spill"], second)
+check("no scan logged for later maps", not any("Checked" in l for l in lines), lines)
+
+# a project with nothing selected: later maps check nothing at all
+P5._TEMPLATE_SELECTIONS.clear()
+P5._clear_layer_selections(arcpy, project(selected=()), template=template)
+Timed.checked = []
+P5._clear_layer_selections(arcpy, project(selected=()), template=template)
+check("nothing selected: later maps check no layers", Timed.checked == [], Timed.checked)
+
+# the template is saved again mid-run with a new selection: checked afresh
+_t.sleep(0.01)
+with open(template, "w") as f:
+    f.write("v2 — saved again")
+Timed.checked = []
+again = P5._clear_layer_selections(arcpy, project(selected=("Parcels",)), template=template)
+check("changed template is checked again in full", len(set(Timed.checked)) == 6, Timed.checked)
+check("and its new selection is cleared", again == ["Parcels"], again)
+
+# a layer that cannot report stays on the list to check
+P5._TEMPLATE_SELECTIONS.clear()
+def unsure_project():
+    m = project(selected=())
+    m._layers[3]._raises = True
+    return m
+P5._clear_layer_selections(arcpy, unsure_project(), template=template)
+Timed.checked = []
+P5._clear_layer_selections(arcpy, unsure_project(), template=template)
+check("a layer that cannot report is re-checked", set(Timed.checked) == {"Laterals"}, Timed.checked)
+
+# no template given: every layer, every time, as before
+Timed.checked = []
+P5._clear_layer_selections(arcpy, project(selected=()))
+P5._clear_layer_selections(arcpy, project(selected=()))
+check("no template: every layer every time", len(Timed.checked) == 12, len(Timed.checked))
+shutil.rmtree(tmpdir, ignore_errors=True)
 
 # ---- saved definition queries are reported --------------------------------
 class Cur:

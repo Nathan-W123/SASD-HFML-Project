@@ -222,8 +222,26 @@ changes, each with a fallback to the previous behaviour:
 - **Selections cleared without the tool.** A layer with a saved selection is
   cleared with `Layer.setSelectionSet`, then checked; only if it is still
   selected does the selection tool run, as before. A map is never exported
-  with a stale selection either way. Clearing the selections in the project
-  and saving it removes the step entirely.
+  with a stale selection either way.
+- **Layers checked for selections once per run.** With the project's saved
+  selections cleared, the step still took 11–14s a map (2026-11-19) — the cost
+  is in asking every layer. Every map's project is a copy of the same template,
+  so its layers are asked once; later maps ask only layers that had a
+  selection. If the template file changes mid-run it is checked again in full.
+  The one check logs the layers slowest to answer and any with a broken data
+  source.
+
+### Cache fingerprints
+
+The cache decides whether a source changed from its row count plus the time
+stamp and size of the files holding it. A file geodatabase stores each table in
+its own files (`a{ID}.gdbtable` and index files, the ID being the dataset's
+`DSID`), so only those are checked — SQL_WEB.gdb holds many layers and changes
+several times a day, and a change to any of them used to re-copy the mainlines
+and parcels (~65s). Whenever the files cannot be identified with confidence
+(no `DSID`, no matching `.gdbtable`, a size that does not fit the row count),
+the whole geodatabase is fingerprinted as before. The log shows which:
+`"scope": "table"` or `"scope": "geodatabase"`.
 
 ### When PM_Mainlines briefly reads as missing
 

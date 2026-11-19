@@ -1726,9 +1726,11 @@ def _setup_phase4_cache(arcpy, config, ml_source, log_fn):
         if not config.get(flag, True):
             continue
         remote = config[config_key]
+        source_signature = dataset_signature(arcpy, remote)
+        log_fn(f"  {label} source fingerprint: {source_signature}")
         local = cache.local_copy(
             arcpy, remote, name, label,
-            dataset_signature(arcpy, remote),
+            source_signature,
             min_free_gb=min_free_gb,
         )
         if local:

@@ -65,17 +65,76 @@ def _gdb_root(path):
     return None
 
 
+# Bytes per row a table's own files can plausibly hold.  Outside this, the files
+# picked out for a dataset are assumed to belong to some other table and the
+# whole-geodatabase fingerprint is used instead.
+_MIN_BYTES_PER_ROW = 16
+_MAX_BYTES_PER_ROW = 200_000
+
+
+def _table_files(arcpy, path, count):
+    """The files holding this one table in a file geodatabase, or None.
+
+    A file geodatabase stores each table as a{ID}.gdbtable plus index files
+    a{ID}.*, the ID being the dataset's DSID as eight hex digits.  Fingerprinting
+    just those means a change to some other layer in a shared geodatabase --
+    SQL_WEB.gdb holds many and is republished several times a day -- no longer
+    forces the mainlines and parcels to be copied again.
+
+    Returns None, so the caller falls back to the whole geodatabase, whenever
+    the files cannot be identified with confidence: not a file geodatabase, no
+    DSID, no .gdbtable with that ID, or a size that does not fit the row count.
+    Falling back only costs a re-copy; trusting the wrong files could keep a
+    stale copy, so every doubt falls back.
+    """
+    root = _gdb_root(path)
+    if not root or not root.lower().endswith(".gdb") or not os.path.isdir(root):
+        return None
+    try:
+        dsid = int(getattr(arcpy.Describe(path), "DSID"))
+    except Exception:
+        return None
+    if dsid <= 0 or not count:
+        return None
+    prefix = f"a{dsid:08x}."
+    try:
+        files = [e for e in os.scandir(root) if e.is_file() and e.name.lower().startswith(prefix)]
+    except OSError:
+        return None
+    if not any(e.name.lower().endswith(".gdbtable") for e in files):
+        return None
+    try:
+        size = sum(e.stat().st_size for e in files)
+    except OSError:
+        return None
+    if not _MIN_BYTES_PER_ROW <= size / count <= _MAX_BYTES_PER_ROW:
+        return None
+    return files
+
+
 def dataset_signature(arcpy, path):
     """A cheap fingerprint of a dataset, used to spot changes in the source.
 
-    Feature count plus, for a file geodatabase, the newest file timestamp and
-    the total size of the geodatabase folder.  Reads no feature geometry.
+    Feature count plus the newest timestamp and total size of the files holding
+    it: just this table's files when they can be identified (scope "table"),
+    otherwise the whole geodatabase folder (scope "geodatabase").  Reads no
+    feature geometry.
     """
-    signature = {"count": None, "newest_mtime": None, "total_size": None}
+    signature = {"count": None, "scope": None, "newest_mtime": None, "total_size": None}
     try:
         signature["count"] = int(arcpy.management.GetCount(path)[0])
     except Exception:
         pass
+
+    table_files = _table_files(arcpy, path, signature["count"])
+    if table_files:
+        try:
+            signature["newest_mtime"] = round(max(e.stat().st_mtime for e in table_files), 3)
+            signature["total_size"] = sum(e.stat().st_size for e in table_files)
+            signature["scope"] = "table"
+            return signature
+        except OSError:
+            pass
 
     root = _gdb_root(path)
     if root and os.path.isdir(root):
@@ -92,6 +151,7 @@ def dataset_signature(arcpy, path):
         if total:
             signature["newest_mtime"] = round(newest, 3)
             signature["total_size"] = total
+            signature["scope"] = "geodatabase"
     return signature
 
 

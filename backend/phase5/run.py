@@ -967,28 +967,60 @@ def export_today():
     return date.today().strftime("%B %d, %Y")
 
 
-def _clear_layer_selections(arcpy, map_obj):
+# Which layers of a map project were saved with a selection, found by checking
+# every layer once and reused for every map exported from the same, unchanged
+# file.  {project path: {"stamp": (mtime, size), "keys": {(index, name), ...}}}
+_TEMPLATE_SELECTIONS = {}
+# A layer slower than this to report its selection is named in the log.
+_SLOW_LAYER_SECONDS = 0.5
+
+
+def _file_stamp(path):
+    try:
+        st = os.stat(path)
+        return (st.st_mtime, st.st_size)
+    except (OSError, TypeError):
+        return None
+
+
+def _clear_layer_selections(arcpy, map_obj, template=None, log_fn=None):
     """Clear selections on the map's layers -- but only layers that have one.
 
-    The old loop ran SelectLayerByAttribute(CLEAR_SELECTION) on every layer in
-    the project: one geoprocessing call each, ~50s per map measured on
-    2026-11-17, half of every export.  This process opens a fresh copy of the
-    project, so a selection is normally there only if one was saved with it.
-    getSelectionSet() is a plain property read, so asking first is free.
+    Asking every layer whether it has a selection cost 11-14s a map even with
+    nothing selected (2026-11-19, after the saved selections were cleared from
+    TEST.aprx), so the cost is in the asking.  Every map's project is a fresh
+    copy of the same template file, so its layers are asked once per run; the
+    layers that had a selection are remembered, and later maps from the same
+    file ask only those.  If the template file changes -- its time stamp or size
+    -- every layer is asked again, so a selection saved mid-run cannot slip
+    through.  With no template given, every layer is asked, as before.
 
-    A layer that cannot report its selection is cleared anyway, as before.
-    Returns the names of the layers that were cleared.
+    A layer that cannot report its selection is cleared anyway, as before, and
+    stays on the list to check.  Returns the names of the layers that were cleared.
     """
-    cleared = []
-    for layer in map_obj.listLayers():
-        if layer.isGroupLayer or not getattr(layer, "isFeatureLayer", True):
-            continue
+    layers = [
+        (index, layer) for index, layer in enumerate(map_obj.listLayers())
+        if not layer.isGroupLayer and getattr(layer, "isFeatureLayer", True)
+    ]
+    stamp = _file_stamp(template) if template else None
+    known = _TEMPLATE_SELECTIONS.get(template) if stamp else None
+    scanning = known is None or known["stamp"] != stamp
+    if not scanning:
+        layers = [(i, layer) for i, layer in layers if (i, layer.name) in known["keys"]]
+
+    cleared, keys, slow = [], set(), []
+    for index, layer in layers:
+        started = time.perf_counter()
         try:
             has_selection = bool(layer.getSelectionSet())
         except Exception:
             has_selection = True
+        took = time.perf_counter() - started
+        if scanning and took > _SLOW_LAYER_SECONDS:
+            slow.append((took, layer.name, bool(getattr(layer, "isBroken", False))))
         if not has_selection:
             continue
+        keys.add((index, layer.name))
         # Layer.setSelectionSet is a property-level call, not a geoprocessing
         # tool -- the tool took ~7s per layer (2026-11-17).  It only counts if
         # the selection really is empty afterwards; otherwise the tool runs as
@@ -1001,6 +1033,23 @@ def _clear_layer_selections(arcpy, map_obj):
             cleared.append(f"{layer.name} (with the selection tool)")
         except Exception:
             pass
+
+    if scanning and stamp:
+        _TEMPLATE_SELECTIONS[template] = {"stamp": stamp, "keys": keys}
+        if log_fn:
+            log_fn(
+                f"  Checked {len(layers)} layer(s) of the map project for saved selections — "
+                f"{len(keys)} had one; later maps this run check only those"
+            )
+            if slow:
+                slow.sort(reverse=True)
+                log_fn(
+                    "  Slowest layers to check: "
+                    + ", ".join(
+                        f"{name} {took:.1f}s" + (" (broken data source)" if broken else "")
+                        for took, name, broken in slow[:8]
+                    )
+                )
     return cleared
 
 
@@ -1067,7 +1116,7 @@ def export_hfml_map(arcpy, hfml, config, today, observations_map, log_fn):
 
         # Clear any selections carried over from the user's ArcGIS Pro session
         with watch.part("clear selections"):
-            cleared = _clear_layer_selections(arcpy, map_obj)
+            cleared = _clear_layer_selections(arcpy, map_obj, template=aprx_src, log_fn=log_fn)
         if cleared:
             log_fn(
                 f"  Cleared selections saved in the project on {len(cleared)} layer(s): "
