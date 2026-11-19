@@ -13,7 +13,7 @@ PHASES = [
     ("backend.phase1.run", "Import SQL query results into Excel"),
     ("backend.phase2.run", "Detect ML changes and rebuild workbook"),
     ("backend.phase3.run", "Sync Excel data to ArcGIS attribute table"),
-    ("backend.phase4.run", "Trace and map the next 25 new HFMLs"),
+    ("backend.phase4.run", "Trace and map all new HFMLs"),
     ("backend.phase5.run", "Verify PDF maps from Phase 4"),
 ]
 

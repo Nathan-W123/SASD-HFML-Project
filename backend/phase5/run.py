@@ -409,6 +409,16 @@ def _report_offscreen_features(arcpy, hfml, config, camera_extent, log_fn):
             )
 
 
+def _short_query(query, keep=5):
+    # A trace can hold hundreds of IDs; over a full run the whole lists made the
+    # log too long to read.
+    m = re.match(r"^\s*OBJECTID IN \(([^)]*)\)\s*$", query or "", re.I)
+    ids = [v.strip() for v in m.group(1).split(",") if v.strip()] if m else []
+    if len(ids) <= keep:
+        return query
+    return f"OBJECTID IN ({','.join(ids[:keep])},... {len(ids)} IDs)"
+
+
 def _log_layer_report(arcpy, map_obj, hfml_id, config, log_fn, hfml=None):
     """Log what each HFML/trace layer in the map points at and how many features
     it will draw, so a map missing the HFML or MLs shows why in the log.
@@ -474,7 +484,7 @@ def _log_layer_report(arcpy, map_obj, hfml_id, config, log_fn, hfml=None):
                 )
         log_fn(
             f"  Layer '{layer.name}' [{role or 'NOT a Phase 4 output'}] draws {count} feature(s)"
-            f"{note}{renderer}; query={query!r}; source={source}"
+            f"{note}{renderer}; query={_short_query(query)!r}; source={source}"
         )
     for path, role in expected.items():
         if role not in seen:
@@ -1560,8 +1570,8 @@ def _export_one(arcpy, base_config, hfml, log_fn):
 
 _RESULT_MARKER = "@@HFML-EXPORT-RESULT@@ "
 # Start a fresh process after this many maps, so memory cannot build up over a
-# long run.
-EXPORT_WORKER_MAX_MAPS = 25
+# long run.  Each restart costs ~25s (Python, arcpy, opening the project).
+EXPORT_WORKER_MAX_MAPS = 100
 
 
 def _export_worker_serve(handle_job, stdin=None, stdout=None):

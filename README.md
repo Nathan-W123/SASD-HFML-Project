@@ -7,7 +7,7 @@ An ArcGIS Pro Python Toolbox (`SASD_HFML.pyt`) that automates the monthly High F
 - **Phase 1** - Connect to SQL database, run query, export results, import into Excel as a new `import` sheet
 - **Phase 2** - Excel manipulation: detect added/removed MLs and frequency changes, rebuild the working sheet
 - **Phase 3** - Sync Excel data to ArcGIS attribute table via Excel To Table and Append with upsert logic
-- **Phase 4** - For the next 25 new HFMLs, one at a time: trace and append upstream MLs, contacting LLs, and parcels; export that HFML's PDF map and save the map as a project into a dated run folder (`PDF_Output/<YYYY-MM-DD HH-MM>/`, projects under `Temp GIS Maps/`); then delete the appended features
+- **Phase 4** - For every new HFML, one at a time: trace and append upstream MLs, contacting LLs, and parcels; export that HFML's PDF map and save the map as a project into a dated run folder (`PDF_Output/<YYYY-MM-DD HH-MM>/`, projects under `Temp GIS Maps/`); then delete the appended features
 - **Phase 5** - Verify every HFML mapped by Phase 4 has its PDF
 
 ## Project Structure
@@ -224,7 +224,7 @@ changes, each with a fallback to the previous behaviour:
   once. Each map gets its own copy of the config, so one map's settings never
   reach the next. If the
   process dies mid-map it is replaced and that map retried once; it is also
-  replaced every 25 maps so memory cannot build up. `p4_export_reuse_process:
+  replaced every 100 maps so memory cannot build up. `p4_export_reuse_process:
   false` restores one process per map.
 - **Selections cleared without the tool.** A layer with a saved selection is
   cleared with `Layer.setSelectionSet`, then checked; only if it is still
@@ -245,7 +245,7 @@ changes, each with a fallback to the previous behaviour:
 
 With every map opening its own fresh copy of the map project, 11–17s of each
 map went on opening the map's ~32 layers over the network (2026-11-19). The
-export process now keeps one copy open for the run (it is replaced every 25
+export process now keeps one copy open for the run (it is replaced every 100
 maps, with the process) and, before every map, puts back everything an export
 changes, so each map starts exactly as a fresh copy would:
 

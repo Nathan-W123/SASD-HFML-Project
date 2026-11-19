@@ -38,8 +38,9 @@ MAX_GAP_REPORT_LINES = 10
 # Buckets for the once-per-cache-build report on how close manholes sit to each
 # other without sharing a key.  The shape of this picks the snap tolerance.
 GAP_HISTOGRAM_BUCKETS = (0.01, 0.1, 0.5, 1.0)
-# Raised from 5 to 25 on 2026-11-19, once a map after the first took ~12s.
-MAX_HFMLS_PER_RUN = 25
+# None maps every new HFML in one run (2026-11-19, ~13s a map).  A number caps
+# the run at that many; the rest are picked up by the next run.
+MAX_HFMLS_PER_RUN = None
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 ADDED_MLS_PATH = os.path.join(PROJECT_ROOT, "temp", "added_mls.json")
 PHASE4_MAP_OUTPUT_PATH = os.path.join(PROJECT_ROOT, "temp", "phase4_mapped_hfmls.json")
@@ -2096,7 +2097,10 @@ def _run(log_fn, layer_pool=None):
         _write_phase4_map_manifest([], log_fn)
         return
 
-    log_fn(f"Mapping up to {MAX_HFMLS_PER_RUN} HFMLs this run")
+    if MAX_HFMLS_PER_RUN:
+        log_fn(f"Mapping up to {MAX_HFMLS_PER_RUN} HFMLs this run")
+    else:
+        log_fn(f"Mapping all {len(new_hfmls)} new HFMLs this run")
     # One folder per run holds the PDFs plus a "Temp GIS Maps" subfolder with
     # each map saved as a project.  Created on the first export.
     run_dir = new_run_dir(config)
@@ -2124,7 +2128,7 @@ def _run(log_fn, layer_pool=None):
     hfml_records = []
     failed = []
     for i, hfml in enumerate(new_hfmls, 1):
-        if len(hfml_records) + len(failed) >= MAX_HFMLS_PER_RUN:
+        if MAX_HFMLS_PER_RUN and len(hfml_records) + len(failed) >= MAX_HFMLS_PER_RUN:
             log_fn(f"Reached {MAX_HFMLS_PER_RUN}-HFML limit — remaining {len(new_hfmls) - i + 1} left for the next run")
             break
         pmnum = hfml["pmnum"]
