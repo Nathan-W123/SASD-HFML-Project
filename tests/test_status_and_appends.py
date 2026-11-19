@@ -135,8 +135,125 @@ NEW._append_by_oids(a, picks, "src", "dst", log_fn=lines.append)
 check("partial copy cleaned up, then Append: each row once", len(a.datasets["dst"]) == 12, len(a.datasets["dst"]))
 check("fell back to Append", a.calls.get("Append", 0) == 1, a.calls)
 check("fallback reported", any("direct row copy" in l and "edit session" in l for l in lines), lines)
+check("  and the next call will try the direct copy again", any("tried again next time" in l for l in lines), lines)
 NEW._append_by_oids(a, picks[:2], "src", "dst", log_fn=lines.append)
-check("fast path not retried after it failed", a.calls.get("Append", 0) == 2, a.calls)
+check("direct copy tried again on the next call", a.calls.get("Append", 0) == 1 and len(a.datasets["dst"]) == 14,
+      (a.calls, len(a.datasets["dst"])))
+
+NEW.DIRECT_COPY_LOCK_WAIT = 0       # no real waiting in tests
+def reference(picks, seed):
+    data, schemas = append_data(seed)
+    a_ref = S.Arcpy(data, schemas); OLD._append_by_oids(a_ref, picks, "src", "dst")
+    return contents(a_ref)
+
+# 2026-11-19: the insert cursor hit "Cannot acquire a lock" when it closed, so
+# nothing was committed, and removing the rows hit the same lock.
+data, schemas = append_data(7)
+picks = sorted(data["src"])[:9]
+NEW._APPEND_PLANS.clear()
+a = S.Arcpy(data, schemas)
+real_insert, real_update = a._insert, a._update
+state = {"insert_locks": 1, "update_locks": 1}
+def locked_on_close(path, fields):
+    ins = real_insert(path, fields)
+    if not state["insert_locks"]:
+        return ins
+    state["insert_locks"] -= 1
+    added = []; real_row = ins.insertRow
+    ins.insertRow = lambda values: added.append(real_row(values)) or added[-1]
+    def exit_(*exc):
+        for oid in added: a.datasets[path].pop(oid, None)      # never committed
+        raise RuntimeError("Cannot acquire a lock.")
+    ins.__exit__ = exit_
+    return ins
+class _LockedOnce:
+    def __init__(self, inner): self.inner = inner
+    def __enter__(self):
+        if state["update_locks"]:
+            state["update_locks"] -= 1
+            raise RuntimeError("Cannot acquire a lock.")
+        return self.inner.__enter__()
+    def __exit__(self, *e): return self.inner.__exit__(*e)
+a.da.UpdateCursor = lambda path, fields, where=None: _LockedOnce(real_update(path, fields, where))
+class _ExitHook:   # `with` looks __exit__ up on the class, so wrap the stub cursor
+    def __init__(self, ins): self.ins = ins
+    def __enter__(self): return self.ins
+    def __exit__(self, *e): return self.ins.__exit__(*e)
+a.da.InsertCursor = lambda path, fields: _ExitHook(locked_on_close(path, fields))
+lines = []
+NEW._append_by_oids(a, picks, "src", "dst", log_fn=lines.append)
+check("lock on commit: rows copied once", contents(a) == reference(picks, 7), (len(a.datasets["dst"]), len(picks)))
+check("lock on commit: no Append tool call", a.calls.get("Append", 0) == 0, a.calls)
+check("lock on commit: retry reported", any("was locked" in l for l in lines), lines)
+check("lock on commit: fast path kept", NEW._APPEND_PLANS[("src", "dst")]["direct"]
+      and NEW._APPEND_PLANS[("src", "dst")]["failures"] == 0, NEW._APPEND_PLANS)
+
+# fails part-way and the rows it inserted cannot be removed: Append only the rest
+def failing_insert(a, at, message):
+    real = a._insert
+    def make(path, fields):
+        ins = real(path, fields); n = {"n": 0}; real_row = ins.insertRow
+        def insertRow(values):
+            n["n"] += 1
+            if n["n"] == at: raise RuntimeError(message)
+            return real_row(values)
+        ins.insertRow = insertRow
+        return ins
+    return make
+class _NoDelete:
+    def __init__(self, inner): self.inner = inner
+    def __enter__(self): self.inner.__enter__(); return self
+    def __exit__(self, *e): return False
+    def __iter__(self): return iter(self.inner)
+    def deleteRow(self): raise RuntimeError("Cannot acquire a lock.")
+data, schemas = append_data(8)
+picks = sorted(data["src"])[:12]
+NEW._APPEND_PLANS.clear()
+a = S.Arcpy(data, schemas)
+a.da.InsertCursor = failing_insert(a, 6, "The row contains a bad value")
+upd = a._update
+a.da.UpdateCursor = lambda path, fields, where=None: _NoDelete(upd(path, fields, where))
+lines = []
+NEW._append_by_oids(a, picks, "src", "dst", log_fn=lines.append)
+check("rows left behind: each row once", contents(a) == reference(picks, 8), (len(a.datasets["dst"]), len(picks)))
+check("rows left behind: Append only for the rest", a.calls.get("Append", 0) == 1, a.calls)
+
+# ...and when even reading the destination fails, stop rather than risk duplicates
+data, schemas = append_data(9)
+picks = sorted(data["src"])[:12]
+NEW._APPEND_PLANS.clear()
+a = S.Arcpy(data, schemas)
+a.da.InsertCursor = failing_insert(a, 6, "The row contains a bad value")
+upd, search = a._update, a._search
+a.da.UpdateCursor = lambda path, fields, where=None: _NoDelete(upd(path, fields, where))
+def unreadable(path, fields, where=None):
+    if path == "dst": raise RuntimeError("Cannot acquire a lock.")
+    return search(path, fields, where)
+a.da.SearchCursor = unreadable
+try:
+    NEW._append_by_oids(a, picks, "src", "dst")
+    raised = False
+except NEW._DirectCopyUnknown:
+    raised = True
+check("unknown leftovers: the HFML fails", raised)
+check("unknown leftovers: no Append on top", a.calls.get("Append", 0) == 0, a.calls)
+
+# two failures in a row: Append for the rest of the run
+data, schemas = append_data(10)
+picks = sorted(data["src"])[:4]
+NEW._APPEND_PLANS.clear()
+a = S.Arcpy(data, schemas)
+tries = {"n": 0}
+def always_fails(path, fields):
+    tries["n"] += 1
+    raise RuntimeError("Objects in this class cannot be updated outside an edit session")
+a.da.InsertCursor = always_fails
+lines = []
+for _ in range(3):
+    NEW._append_by_oids(a, picks, "src", "dst", log_fn=lines.append)
+check("two failures in a row: direct copy given up", tries["n"] == 2 and a.calls.get("Append", 0) == 3,
+      (tries, a.calls))
+check("  and reported", any("rest of this run" in l for l in lines), lines)
 
 # different coordinate systems: never use the direct copy
 data, schemas = append_data(5)

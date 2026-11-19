@@ -911,6 +911,40 @@ def _append_plan(arcpy, source, destination):
     return plan
 
 
+# A direct copy that fails is tried again on the next call; only this many
+# failures in a row switch that source/destination pair to the Append tool for
+# the rest of the run.  2026-11-19: one brief lock on PMs_SSGRAVITYMAIN at the
+# first HFML used to cost the Append tool's ~4s on every later HFML.
+DIRECT_COPY_MAX_FAILURES = 2
+# Seconds to wait before trying again after a lock.  The Append run straight
+# after that 2026-11-19 lock went through, so locks clear quickly.
+DIRECT_COPY_LOCK_WAIT = 2.0
+
+
+class _DirectCopyLeftRows(RuntimeError):
+    """A direct copy failed part-way and some of its rows could not be removed.
+
+    `copied` holds the SOURCE object IDs whose rows are in the destination, so
+    the caller appends only the rest and no row ends up there twice.
+    """
+
+    def __init__(self, message, copied):
+        super().__init__(message)
+        self.copied = set(copied)
+
+
+class _DirectCopyUnknown(RuntimeError):
+    """A direct copy failed part-way and which rows it left behind is unknown.
+
+    Not caught by the fallback: appending again could duplicate rows, so the
+    HFML fails instead and is rolled back and picked up again next run.
+    """
+
+
+def _is_lock_error(exc):
+    return "lock" in str(exc).lower()
+
+
 def _delete_oids(arcpy, path, oids):
     for chunk in _chunks(sorted(set(oids))):
         with arcpy.da.UpdateCursor(path, ["OID@"], _oid_where(chunk)) as cursor:
@@ -918,37 +952,120 @@ def _delete_oids(arcpy, path, oids):
                 cursor.deleteRow()
 
 
+def _existing_oids(arcpy, path, oids):
+    found = set()
+    for chunk in _chunks(sorted(set(oids))):
+        with arcpy.da.SearchCursor(path, ["OID@"], _oid_where(chunk)) as cursor:
+            found.update(row[0] for row in cursor)
+    return found
+
+
+def _undo_partial_copy(arcpy, destination, inserted, error):
+    """Remove the rows a failed direct copy inserted.
+
+    Returns quietly when none of them are left in the destination -- removed
+    here, or never committed, as when the insert cursor itself hit the lock.
+    Raises _DirectCopyLeftRows naming the rows that are there and could not be
+    removed, or _DirectCopyUnknown when even that cannot be read.
+    """
+    dst_oids = [dst for _, dst in inserted if dst is not None]
+    if not dst_oids:
+        return
+    cleanup_error = None
+    for wait in (0, DIRECT_COPY_LOCK_WAIT):
+        if wait:
+            time.sleep(wait)
+        try:
+            _delete_oids(arcpy, destination, dst_oids)
+            return
+        except Exception as exc:
+            cleanup_error = exc
+    try:
+        present = _existing_oids(arcpy, destination, dst_oids)
+    except Exception as check_error:
+        raise _DirectCopyUnknown(
+            f"direct copy into {destination} failed ({error}); its {len(dst_oids)} partial "
+            f"row(s) could not be removed ({cleanup_error}) or checked ({check_error})"
+        ) from error
+    if present:
+        raise _DirectCopyLeftRows(
+            f"direct copy into {destination} failed ({error}) and {len(present)} of its rows "
+            f"could not be removed ({cleanup_error})",
+            {src for src, dst in inserted if dst in present},
+        ) from error
+
+
 def _append_rows_directly(arcpy, oid_list, source, destination, plan):
     """Copy rows with a search cursor into an insert cursor.
 
     The Append tool measured 4-9s per call (2026-11-17), the same fixed cost
     every other geoprocessing tool showed, for a handful of rows.  If anything
-    fails part-way the rows inserted so far are deleted again, so the caller
-    can fall back to Append without leaving duplicates.
+    fails part-way the rows inserted so far are removed again (see
+    _undo_partial_copy), so the caller can fall back without leaving duplicates.
     """
     pairs = plan["pairs"]
-    src_names = ["SHAPE@"] + [p[0] for p in pairs]
+    src_names = ["OID@", "SHAPE@"] + [p[0] for p in pairs]
     dst_names = ["SHAPE@"] + [p[1] for p in pairs]
-    inserted = []
+    inserted = []  # (source OID, destination OID)
     try:
         with arcpy.da.InsertCursor(destination, dst_names) as insert:
             for chunk in _chunks(sorted(set(oid_list))):
                 with arcpy.da.SearchCursor(source, src_names, _oid_where(chunk)) as cursor:
                     for row in cursor:
-                        values = [row[0]]
-                        for value, (_, _, src_type, dst_type) in zip(row[1:], pairs):
+                        values = [row[1]]
+                        for value, (_, _, src_type, dst_type) in zip(row[2:], pairs):
                             values.append(value if src_type == dst_type else _coerce_for_field(value, dst_type))
-                        inserted.append(insert.insertRow(values))
-    except Exception:
-        try:
-            _delete_oids(arcpy, destination, [oid for oid in inserted if oid is not None])
-        except Exception as cleanup_exc:
-            raise RuntimeError(
-                f"direct copy into {destination} failed and its {len(inserted)} partial row(s) "
-                f"could not be removed: {cleanup_exc}"
-            ) from cleanup_exc
+                        inserted.append((row[0], insert.insertRow(values)))
+    except Exception as exc:
+        _undo_partial_copy(arcpy, destination, inserted, exc)
         raise
     return len(inserted)
+
+
+def _try_direct_copy(arcpy, oid_list, source, destination, plan, log_fn=None):
+    """Copy with the direct row copy.  Returns the source OIDs still to append.
+
+    A lock gets one more try after a short wait.  Whatever is left after that
+    goes to the Append tool, and the direct copy is tried again on the next
+    call unless it has now failed DIRECT_COPY_MAX_FAILURES times in a row.
+    """
+    remaining = list(oid_list)
+    error = None
+    for attempt in (1, 2):
+        try:
+            _append_rows_directly(arcpy, remaining, source, destination, plan)
+            plan["failures"] = 0
+            return []
+        except _DirectCopyUnknown:
+            raise
+        except _DirectCopyLeftRows as exc:
+            remaining = [oid for oid in remaining if oid not in exc.copied]
+            error = exc
+        except Exception as exc:
+            error = exc
+        if not remaining:
+            plan["failures"] = 0
+            return []
+        if attempt == 1 and _is_lock_error(error):
+            if log_fn:
+                log_fn(
+                    f"  NOTE: {destination} was locked ({error}) — "
+                    f"trying the direct row copy again in {DIRECT_COPY_LOCK_WAIT:g}s"
+                )
+            time.sleep(DIRECT_COPY_LOCK_WAIT)
+            continue
+        break
+
+    plan["failures"] = plan.get("failures", 0) + 1
+    if plan["failures"] >= DIRECT_COPY_MAX_FAILURES:
+        plan["direct"] = False
+        plan["reason"] = str(error)
+        then = "using the Append tool for it for the rest of this run"
+    else:
+        then = "using the Append tool for these rows; the direct copy is tried again next time"
+    if log_fn:
+        log_fn(f"  NOTE: direct row copy into {destination} failed ({error}) — {then}")
+    return remaining
 
 
 def _append_by_oids(arcpy, oid_list, source, destination, log_fn=None):
@@ -956,19 +1073,9 @@ def _append_by_oids(arcpy, oid_list, source, destination, log_fn=None):
         return
     plan = _append_plan(arcpy, source, destination)
     if plan["direct"]:
-        try:
-            _append_rows_directly(arcpy, oid_list, source, destination, plan)
+        oid_list = _try_direct_copy(arcpy, oid_list, source, destination, plan, log_fn)
+        if not oid_list:
             return
-        except Exception as exc:
-            # Don't keep paying for a failing fast path: use Append for this
-            # pair for the rest of the run.
-            plan["direct"] = False
-            plan["reason"] = str(exc)
-            if log_fn:
-                log_fn(
-                    f"  NOTE: direct row copy into {destination} failed ({exc}) — "
-                    "using the Append tool for it for the rest of this run"
-                )
     query = f"OBJECTID IN ({','.join(map(str, oid_list))})"
     subset_layer = _replace_temp_layer(arcpy, "_TmpSubset", source, query)
     try:
@@ -1660,6 +1767,19 @@ def _read_assetnum_segments(arcpy, ml_source, assetnum_set, config, log_fn):
     return segments
 
 
+def _log_fingerprint_notes(label, signature, notes, log_fn):
+    """Say why a source is fingerprinted by its whole geodatabase, if it is.
+
+    That scope means any other layer in the same geodatabase changing forces
+    this source to be copied again, so the reason is worth seeing in the log.
+    """
+    if signature.get("scope") == "geodatabase" and notes:
+        log_fn(
+            f"  {label} source: watching the whole geodatabase, since its own table "
+            f"files were not found — {'; '.join(notes)}"
+        )
+
+
 def _setup_phase4_cache(arcpy, config, ml_source, log_fn):
     """Prepare the local cache.
 
@@ -1692,11 +1812,17 @@ def _setup_phase4_cache(arcpy, config, ml_source, log_fn):
     )
     log_fn(f"Phase 4 cache folder: {cache.dir}")
 
-    signature = dataset_signature(arcpy, ml_source)
+    notes = []
+    signature = dataset_signature(
+        arcpy, ml_source,
+        previous=cache.stored_signature("ml_source") or cache.stored_signature("network"),
+        notes=notes,
+    )
     # Part of the fingerprint: a pickled network built at a different tolerance
     # has different manhole keys and must not be reused.
     signature["snap_tolerance"] = float(config.get("p4_node_snap_tolerance_feet", 0.1) or 0.0)
     log_fn(f"  ML source fingerprint: {signature}")
+    _log_fingerprint_notes("ML", signature, notes, log_fn)
     if signature_is_weak(signature):
         log_fn(
             "  NOTE: only a feature count is available for this source, so an edit "
@@ -1726,8 +1852,12 @@ def _setup_phase4_cache(arcpy, config, ml_source, log_fn):
         if not config.get(flag, True):
             continue
         remote = config[config_key]
-        source_signature = dataset_signature(arcpy, remote)
+        notes = []
+        source_signature = dataset_signature(
+            arcpy, remote, previous=cache.stored_signature(name), notes=notes
+        )
         log_fn(f"  {label} source fingerprint: {source_signature}")
+        _log_fingerprint_notes(label, source_signature, notes, log_fn)
         local = cache.local_copy(
             arcpy, remote, name, label,
             source_signature,

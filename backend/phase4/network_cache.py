@@ -29,6 +29,7 @@ import json
 import os
 import pickle
 import shutil
+import struct
 import tempfile
 import time
 
@@ -65,76 +66,183 @@ def _gdb_root(path):
     return None
 
 
-# Bytes per row a table's own files can plausibly hold.  Outside this, the files
-# picked out for a dataset are assumed to belong to some other table and the
-# whole-geodatabase fingerprint is used instead.
-_MIN_BYTES_PER_ROW = 16
-_MAX_BYTES_PER_ROW = 200_000
+# Geometry type codes in a .gdbtable field section, by Describe's shapeType.
+# A table without geometry is 0.
+_GEOMETRY_CODES = {"point": 1, "multipoint": 2, "polyline": 3, "polygon": 4, "multipatch": 9}
 
 
-def _table_files(arcpy, path, count):
-    """The files holding this one table in a file geodatabase, or None.
+def _read_table_header(path):
+    """(row count, field count, geometry type code) from a .gdbtable header.
+
+    Layout as read by GDAL's OpenFileGDB driver (filegdbtable.cpp): an int32
+    format version (3, or 4 for ArcGIS Pro 3.2+ 64-bit object IDs), the valid
+    row count (int32 at byte 4 in version 3, int64 at byte 16 in version 4), and
+    at byte 32 the offset of the field section, which holds the geometry type
+    at its byte 8 and the uint16 field count at its byte 12.  None when the file
+    cannot be read that way.
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(40)
+            if len(head) < 40:
+                return None
+            version = struct.unpack_from("<i", head, 0)[0]
+            if version == 3:
+                rows = struct.unpack_from("<i", head, 4)[0]
+            elif version == 4:
+                rows = struct.unpack_from("<q", head, 16)[0]
+            else:
+                return None
+            offset = struct.unpack_from("<Q", head, 32)[0]
+            f.seek(offset)
+            fields_head = f.read(14)
+            if len(fields_head) < 14:
+                return None
+            geometry = fields_head[8]
+            fields = struct.unpack_from("<H", fields_head, 12)[0]
+    except (OSError, struct.error, OverflowError, ValueError):
+        return None
+    if rows < 0:
+        return None
+    return rows, fields, geometry
+
+
+def _table_files(arcpy, path, count, hint=None, notes=None):
+    """(table ID, files) for this one table in a file geodatabase, or None.
 
     A file geodatabase stores each table as a{ID}.gdbtable plus index files
-    a{ID}.*, the ID being the dataset's DSID as eight hex digits.  Fingerprinting
-    just those means a change to some other layer in a shared geodatabase --
-    SQL_WEB.gdb holds many and is republished several times a day -- no longer
-    forces the mainlines and parcels to be copied again.
+    a{ID}.*.  Fingerprinting just those means a change to some other layer in a
+    shared geodatabase -- SQL_WEB.gdb holds many and is republished several
+    times a day -- no longer forces the mainlines and parcels to be copied
+    again.
 
-    Returns None, so the caller falls back to the whole geodatabase, whenever
-    the files cannot be identified with confidence: not a file geodatabase, no
-    DSID, no .gdbtable with that ID, or a size that does not fit the row count.
-    Falling back only costs a re-copy; trusting the wrong files could keep a
-    stale copy, so every doubt falls back.
+    A candidate is only accepted when its own header holds exactly this
+    dataset's row count, field count and geometry type.  Candidates, in order:
+    the ID found last run (`hint`), the ID from Describe's DSID, then every
+    table in the geodatabase, where exactly one may match.  Anything less certain returns
+    None and the caller falls back to the whole geodatabase: falling back only
+    costs a re-copy, while trusting the wrong files could keep a stale copy.
+    Why it fell back is appended to `notes`.
     """
+    def note(text):
+        if notes is not None:
+            notes.append(text)
+
     root = _gdb_root(path)
     if not root or not root.lower().endswith(".gdb") or not os.path.isdir(root):
+        note("not in a file geodatabase folder")
+        return None
+    if not count:
+        note("its row count could not be read")
         return None
     try:
-        dsid = int(getattr(arcpy.Describe(path), "DSID"))
+        field_count = len(arcpy.ListFields(path))
+        described = arcpy.Describe(path)
+    except Exception as exc:
+        note(f"its fields could not be listed ({exc})")
+        return None
+    shape_type = str(getattr(described, "shapeType", "") or "").lower()
+    geometry = _GEOMETRY_CODES.get(shape_type, 0)
+    if shape_type and shape_type not in _GEOMETRY_CODES:
+        note(f"unrecognised shape type {shape_type!r}")
+        return None
+    try:
+        entries = [e for e in os.scandir(root) if e.is_file()]
+    except OSError as exc:
+        note(f"the geodatabase folder could not be listed ({exc})")
+        return None
+
+    by_id = {}
+    for entry in entries:
+        name = entry.name.lower()
+        table_id, dot, _ext = name.partition(".")
+        if dot and len(table_id) == 9 and table_id[0] == "a":
+            by_id.setdefault(table_id, []).append(entry)
+
+    headers = {}
+
+    def header(table_id):
+        if table_id not in headers:
+            files = by_id.get(table_id, [])
+            table = next((e for e in files if e.name.lower().endswith(".gdbtable")), None)
+            headers[table_id] = _read_table_header(table.path) if table else None
+        return headers[table_id]
+
+    def matches(table_id):
+        return header(table_id) == (count, field_count, geometry)
+
+    def describe(found):
+        rows, fields, code = found
+        kind = next((k for k, v in _GEOMETRY_CODES.items() if v == code), "no" if code == 0 else f"type {code}")
+        return f"{rows} rows, {fields} fields and {kind} geometry"
+
+    wanted = describe((count, field_count, geometry))
+    if hint and hint in by_id and matches(hint):
+        return hint, by_id[hint]
+    try:
+        dsid = int(getattr(described, "DSID"))
     except Exception:
-        return None
-    if dsid <= 0 or not count:
-        return None
-    prefix = f"a{dsid:08x}."
-    try:
-        files = [e for e in os.scandir(root) if e.is_file() and e.name.lower().startswith(prefix)]
-    except OSError:
-        return None
-    if not any(e.name.lower().endswith(".gdbtable") for e in files):
-        return None
-    try:
-        size = sum(e.stat().st_size for e in files)
-    except OSError:
-        return None
-    if not _MIN_BYTES_PER_ROW <= size / count <= _MAX_BYTES_PER_ROW:
-        return None
-    return files
+        dsid = None
+    dsid_id = f"a{dsid:08x}" if dsid and dsid > 0 else None
+    if dsid_id and matches(dsid_id):
+        return dsid_id, by_id[dsid_id]
+    if dsid_id is None:
+        note("no DSID")
+    elif dsid_id not in by_id:
+        note(f"DSID {dsid} names no table file ({dsid_id})")
+    else:
+        found = header(dsid_id)
+        note(
+            f"DSID {dsid} names {dsid_id}, which holds "
+            + (describe(found) if found else "an unreadable header")
+            + f", not {wanted}"
+        )
+
+    found = sorted(table_id for table_id in by_id if matches(table_id))
+    if len(found) == 1:
+        return found[0], by_id[found[0]]
+    if found:
+        note(f"{len(found)} tables have {wanted} ({', '.join(found)}), so which is ours is unclear")
+    else:
+        unreadable = sum(1 for table_id in by_id if header(table_id) is None)
+        note(
+            f"none of the geodatabase's {len(by_id)} tables has {wanted}"
+            + (f" ({unreadable} header(s) unreadable)" if unreadable else "")
+        )
+    return None
 
 
-def dataset_signature(arcpy, path):
+def dataset_signature(arcpy, path, previous=None, notes=None):
     """A cheap fingerprint of a dataset, used to spot changes in the source.
 
     Feature count plus the newest timestamp and total size of the files holding
-    it: just this table's files when they can be identified (scope "table"),
-    otherwise the whole geodatabase folder (scope "geodatabase").  Reads no
-    feature geometry.
+    it: just this table's files when they can be identified (scope "table", its
+    file ID under "table"), otherwise the whole geodatabase folder (scope
+    "geodatabase").  Reads no feature geometry.
+
+    `previous` is the signature stored last run; its table ID is tried first so
+    the geodatabase is only scanned when that table has moved.  How the files
+    were found, or why they were not, is appended to `notes`.
     """
-    signature = {"count": None, "scope": None, "newest_mtime": None, "total_size": None}
+    signature = {"count": None, "scope": None, "table": None, "newest_mtime": None, "total_size": None}
     try:
         signature["count"] = int(arcpy.management.GetCount(path)[0])
     except Exception:
         pass
 
-    table_files = _table_files(arcpy, path, signature["count"])
-    if table_files:
+    hint = (previous or {}).get("table")
+    found = _table_files(arcpy, path, signature["count"], hint=hint, notes=notes)
+    if found:
+        table_id, table_files = found
         try:
             signature["newest_mtime"] = round(max(e.stat().st_mtime for e in table_files), 3)
             signature["total_size"] = sum(e.stat().st_size for e in table_files)
             signature["scope"] = "table"
+            signature["table"] = table_id
             return signature
-        except OSError:
-            pass
+        except OSError as exc:
+            if notes is not None:
+                notes.append(f"its table files could not be read ({exc})")
 
     root = _gdb_root(path)
     if root and os.path.isdir(root):
@@ -237,6 +345,13 @@ class Phase4Cache:
             )
             return False
         return True
+
+    def stored_signature(self, name):
+        """The source signature recorded with the local copy `name` (or with
+        the network, for "network"), or None."""
+        key = name if name == "network" else f"copy:{name}"
+        entry = self._read_state().get(key) or {}
+        return entry.get("signature")
 
     def clear(self):
         """Drop the whole cache directory.  Used when a rebuild fails midway."""

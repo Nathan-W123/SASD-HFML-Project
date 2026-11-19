@@ -193,9 +193,15 @@ Two more geoprocessing-heavy steps were then rewritten the same way:
 - **Appends** copy rows with a search cursor into an insert cursor instead of
   the Append tool (4–9s per call measured). Fields are matched by name ignoring
   case, as Append NO_TEST does. Only used when source and destination share a
-  coordinate system, since a cursor does not reproject; if a copy fails
-  part-way the rows it inserted are deleted and that destination falls back to
-  Append for the rest of the run.
+  coordinate system, since a cursor does not reproject. If a copy fails
+  part-way the rows it inserted are deleted, and Append copies those rows
+  instead. A lock gets one retry after 2s first (2026-11-19: one brief lock on
+  `PMs_SSGRAVITYMAIN` at the first HFML put every later HFML on Append, ~4s
+  slower each). The direct copy is tried again on the next call, and only two
+  failures in a row put that destination on Append for the rest of the run.
+  Rows that cannot be deleted are left in place and only the rest appended; if
+  even that cannot be checked, the HFML fails (and is redone next run) rather
+  than risk drawing a row twice.
 - **Map-view filtering** in the export reads each trace layer's dataset through
   the layer's saved definition query and keeps features not disjoint from the
   view, instead of a select-by-location plus clear per layer (~10s a map). Any
@@ -229,19 +235,33 @@ changes, each with a fallback to the previous behaviour:
   so its layers are asked once; later maps ask only layers that had a
   selection. If the template file changes mid-run it is checked again in full.
   The one check logs the layers slowest to answer and any with a broken data
-  source.
+  source. Measured on 2026-11-19 this saved nothing: the 11–17s moved to "layout
+  and camera", the next step to touch the layers. It is the cost of opening the
+  map's ~32 layers over the network, paid again by every map because each map
+  opens its own copy of the project.
 
 ### Cache fingerprints
 
 The cache decides whether a source changed from its row count plus the time
 stamp and size of the files holding it. A file geodatabase stores each table in
-its own files (`a{ID}.gdbtable` and index files, the ID being the dataset's
-`DSID`), so only those are checked — SQL_WEB.gdb holds many layers and changes
-several times a day, and a change to any of them used to re-copy the mainlines
-and parcels (~65s). Whenever the files cannot be identified with confidence
-(no `DSID`, no matching `.gdbtable`, a size that does not fit the row count),
-the whole geodatabase is fingerprinted as before. The log shows which:
-`"scope": "table"` or `"scope": "geodatabase"`.
+its own files (`a{ID}.gdbtable` and index files), so only those are checked —
+SQL_WEB.gdb holds many layers, and a change to any of them used to re-copy the
+mainlines and parcels (70–107s on 2026-11-17 and 2026-11-19).
+
+Finding a table's files: each `.gdbtable` header holds the table's row count,
+field count and geometry type (the layout GDAL's OpenFileGDB driver reads).
+A table is only taken as the source's own when all three match. Tried in
+order: the table ID recorded last run, the ID from Describe's `DSID`, then
+every table in the geodatabase, where exactly one must match. The first
+version trusted `DSID` alone; on 2026-11-19 it found nothing for any of the
+three sources, which is why each was still watching its whole geodatabase.
+
+The log shows `"scope": "table"` with the table's ID, or `"scope":
+"geodatabase"` followed by the reason the files were not found. The first run
+after this change copies all three sources once, because the fingerprint's
+form changed. If whatever republishes SQL_WEB.gdb rewrites every table each
+time, the mainlines and parcels are still re-copied every time — the log will
+show their table files changing.
 
 ### When PM_Mainlines briefly reads as missing
 
@@ -256,6 +276,23 @@ cannot be read, the map fails — it is rolled back and retried next run —
 rather than being exported with the HFML number in place of the gridno or an
 empty callout, which is what the previous fallbacks did and which would then
 have been marked done and never redone.
+
+### Figure title off-centre
+
+The layout's `Figure` text (and `date`) is replaced by the export. A script
+changing an element's text keeps the element's anchor point fixed — with a
+corner anchor, a longer centred title grows sideways and ends up off-centre.
+Typing in ArcGIS Pro keeps the text's alignment point instead. The export now
+does the same: after replacing the text it moves the element so the point the
+text is aligned to (its left edge, centre or right edge) stays where the
+template had it, and logs the move:
+
+```
+  Text 'Figure': moved -0.45 in to keep it center-aligned (anchor TopLeftCorner)
+```
+
+If the element's anchor and alignment cannot be read, it is left where ArcGIS
+puts it and that is logged instead.
 
 ### Appended features that are not drawn
 

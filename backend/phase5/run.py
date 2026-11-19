@@ -651,14 +651,78 @@ def _lookup_gridno(arcpy, config, hfml_id, pm_row=None, log_fn=None):
     return _display(value) if value else hfml_id
 
 
+# Where elementPositionX sits across a text element's width, by its CIM
+# anchor, and where its horizontal alignment puts the point the text grows from.
+_ANCHOR_FRACTION = {
+    "BottomLeftCorner": 0.0, "LeftMidPoint": 0.0, "TopLeftCorner": 0.0,
+    "BottomMidPoint": 0.5, "CenterPoint": 0.5, "TopMidPoint": 0.5,
+    "BottomRightCorner": 1.0, "RightMidPoint": 1.0, "TopRightCorner": 1.0,
+}
+_ALIGNMENT_FRACTION = {"Left": 0.0, "Center": 0.5, "Right": 1.0}
+
+
+def _cim_value(obj, *names):
+    for name in names:
+        if obj is None:
+            return None
+        obj = obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
+    return obj
+
+
+def _text_alignment(element):
+    """(anchor, horizontal alignment) names from a text element's CIM, or None."""
+    for version in ("V3", "V2"):
+        try:
+            cim = element.getDefinition(version)
+        except Exception:
+            continue
+        anchor = _cim_value(cim, "anchor")
+        alignment = _cim_value(cim, "graphic", "symbol", "symbol", "horizontalAlignment")
+        if anchor is not None and alignment is not None:
+            return str(anchor), str(alignment)
+    return None
+
+
+def _replace_text(element, text, log_fn=None):
+    """Set a layout text element's text, keeping it aligned where it was.
+
+    A script changing the text keeps the element's ANCHOR point fixed, so with
+    a corner anchor, centred text grows sideways off-centre.  Typing in Pro
+    keeps the text's alignment point instead -- its centre, for centred text.
+    Do the same: move the element by however far the alignment point moved.
+    """
+    before_x, before_w = element.elementPositionX, element.elementWidth
+    alignment = _text_alignment(element)
+    element.text = text
+    if alignment is None:
+        if log_fn:
+            log_fn(f"  Text '{element.name}': could not read its anchor and alignment — left where ArcGIS put it")
+        return
+    anchor, align = alignment
+    a = _ANCHOR_FRACTION.get(anchor)
+    h = _ALIGNMENT_FRACTION.get(align)
+    if a is None or h is None:
+        if log_fn:
+            log_fn(f"  Text '{element.name}': anchor {anchor}, alignment {align} — left where ArcGIS put it")
+        return
+    shift = (a - h) * (element.elementWidth - before_w)
+    if abs(shift) > 1e-6:
+        element.elementPositionX = before_x + shift
+        if log_fn:
+            log_fn(
+                f"  Text '{element.name}': moved {shift:+.2f} in to keep it {align.lower()}-aligned "
+                f"(anchor {anchor})"
+            )
+
+
 def _set_text_elements(layout, hfml_id, gridno, today, log_fn=None):
     updated = []
     for element in layout.listElements("TEXT_ELEMENT"):
         if element.name == DATE_ELEMENT_NAME:
-            element.text = today
+            _replace_text(element, today, log_fn)
             updated.append(DATE_ELEMENT_NAME)
         elif element.name == FIGURE_ELEMENT_NAME:
-            element.text = f"Figure {gridno} - Area of Interest\nStop The Clog Strategy"
+            _replace_text(element, f"Figure {gridno} - Area of Interest\nStop The Clog Strategy", log_fn)
             updated.append(FIGURE_ELEMENT_NAME)
     if log_fn:
         all_names = [e.name for e in layout.listElements("TEXT_ELEMENT")]
